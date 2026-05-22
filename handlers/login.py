@@ -80,6 +80,38 @@ AUTH_TIMEOUT = 300  # 5 menit
 LOGIN_IDLE_TIMEOUT_SECS = 180  # 3 menit
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Konstanta teks UI (Markdown v1). Pemakaian backslash untuk escape karakter
+# `.` / `!` tidak diperlukan di v1 — hanya `_`, `*`, `[`, `` ` `` yang istimewa.
+# Gunakan tanda kutip ` untuk inline code; itu cara paling aman menampilkan
+# nomor telepon / contoh perintah.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ACCESS_DENIED_TEXT = (
+    "🚫 *Akses Ditolak*\n\n"
+    "Akun Telegram Anda tidak terdaftar sebagai admin bot ini, "
+    "jadi semua perintah diabaikan.\n\n"
+    "Hubungi administrator agar `user_id` Anda dimasukkan ke daftar admin "
+    "(`ADMIN_USER_IDS` di `config.py`)."
+)
+
+
+def _login_success_text(phone_number: str, me) -> str:
+    """Format pesan sukses login yang konsisten di 3 cabang (phone/OTP/password)."""
+    first_name = escape_markdown(me.first_name or "(tanpa nama)", version=1)
+    nomor = escape_markdown(phone_number, version=1)
+    path = escape_markdown(_format_session_saved_path(phone_number), version=1)
+    return (
+        "✅ *Login berhasil!*\n\n"
+        f"👤 Nama akun : {first_name}\n"
+        f"📱 Nomor      : {nomor}\n"
+        f"🆔 User ID    : `{me.id}`\n\n"
+        f"📂 Session disimpan di:\n`{path}`\n\n"
+        "Anda dapat memakai session ini di menu /manage. "
+        "Untuk login akun lain, kirim /login lagi."
+    )
+
+
 async def cleanup_login_sessions():
     """Membersihkan semua login sessions yang masih aktif saat bot shutdown.
     Dipanggil dari bot.py post_shutdown callback.
@@ -141,29 +173,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
     
     welcome_msg = (
-        "🤖 **Bot Login Telegram Userbot**\n\n"
-        "Bot ini akan membantu Anda login ke akun Telegram menggunakan Telethon.\n\n"
-        "**Cara penggunaan:**\n"
-        "1. Kirim nomor telepon Anda dalam format internasional, mis. "
-        "`+628123456789` (ID), `+14155552671` (US), `+447911123456` (UK). "
-        "Untuk Indonesia, `08123456789` juga diterima.\n"
-        "2. Bot akan mengirimkan kode OTP ke Telegram Anda\n"
-        "3. Kirim kode OTP yang diterima\n"
-        "4. Jika akun Anda menggunakan 2FA, kirim password\n\n"
-        "**Perintah:**\n"
-        "/login - Mulai proses login\n"
-        "/manage - Menu manajemen sessions\n"
-        "/resend - Kirim ulang kode OTP\n"
-        "/cancel - Batalkan proses login\n\n"
-        "Kirim /login untuk memulai!"
+        "🤖 *Bot Userbot Telegram*\n\n"
+        "Bot ini membantu Anda *login* ke beberapa akun Telegram (membuat "
+        "session Telethon) lalu *mengelola* akun-akun tsb untuk scrape grup, "
+        "mengundang member, dll.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔑 *Alur login (3 langkah singkat)*\n"
+        "*1.* Kirim nomor telepon akun yang ingin di-login\n"
+        "    Format internasional: `+628123456789` (ID), `+14155552671` (US), "
+        "`+447911123456` (UK), dst.\n"
+        "    Khusus Indonesia, `08123456789` juga diterima.\n"
+        "*2.* Telegram akan mengirimkan kode OTP 5 digit ke akun Anda. "
+        "Kirimkan kode itu ke bot.\n"
+        "*3.* Bila akun Anda mengaktifkan *Two-Step Verification (2FA)*, "
+        "bot akan meminta password 2FA Anda.\n\n"
+        "⏰ *Catatan:* jika tidak ada balasan selama 3 menit di langkah mana "
+        "pun, proses login akan dibatalkan otomatis.\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 *Daftar perintah*\n"
+        "/login — mulai proses login akun baru\n"
+        "/manage — kelola session, scrape grup, undang member\n"
+        "/resend — kirim ulang kode OTP (hanya saat menunggu OTP)\n"
+        "/cancel — batalkan proses login yang sedang berjalan\n\n"
+        "Ketik /login sekarang untuk memulai."
     )
     await update.message.reply_text(welcome_msg, parse_mode='Markdown')
     return ConversationHandler.END
@@ -176,9 +214,7 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -186,28 +222,35 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user sudah punya proses login aktif
     if user_id in user_auths:
         await update.message.reply_text(
-            "⚠️ Anda sudah memiliki proses login yang aktif. "
-            "Gunakan /cancel untuk membatalkan terlebih dahulu."
+            "⚠️ *Masih ada proses login yang berjalan*\n\n"
+            "Selesaikan dulu langkahnya, atau ketik /cancel untuk "
+            "membatalkan proses login sebelumnya. Setelah itu kirim /login lagi.",
+            parse_mode='Markdown',
         )
         return ConversationHandler.END
-    
-    # Hapus pesan user (nomor telepon yang dikirim)
+
+    # Hapus pesan user agar nomor/teks sensitif tidak menumpuk di chat
     try:
         await update.message.delete()
     except Exception:
         pass
-    
+
     await send_and_save_message(
         update, context,
-        "📱 **Langkah 1: Nomor Telepon**\n\n"
-        "Silakan kirim nomor telepon Anda dalam format internasional.\n"
-        "Contoh:\n"
+        "📱 *Langkah 1/3 — Nomor Telepon*\n\n"
+        "Kirim nomor akun Telegram yang ingin di-login dalam format "
+        "internasional (`+<kode_negara><nomor>`).\n\n"
+        "*Contoh:*\n"
         "• `+628123456789` — Indonesia\n"
-        "• `+14155552671` — US\n"
-        "• `+447911123456` — UK\n"
+        "• `+14155552671` — Amerika Serikat\n"
+        "• `+447911123456` — Inggris\n"
         "• `+491701234567` — Jerman\n\n"
-        "Khusus Indonesia, format lokal `08123456789` juga diterima.\n\n"
-        "Gunakan /cancel untuk membatalkan.",
+        "💡 *Tips:*\n"
+        "• Khusus Indonesia, format lokal `08123456789` juga diterima.\n"
+        "• Pastikan akun yang nomornya Anda kirim sedang bisa Anda akses, "
+        "karena kode OTP dikirim ke akun tersebut.\n"
+        "• Ketik /cancel kapan saja untuk membatalkan.\n"
+        "• Jika diam selama 3 menit, proses login dibatalkan otomatis.",
         parse_mode='Markdown',
         reply_markup=ReplyKeyboardRemove()
     )
@@ -221,9 +264,7 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -240,12 +281,14 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not validate_phone(phone_number):
         await send_and_save_message(
             update, context,
-            "❌ Format nomor telepon tidak valid!\n\n"
-            "Kirim nomor dalam format internasional, contoh:\n"
+            "❌ *Format nomor tidak valid*\n\n"
+            "Bot tidak menemukan cukup digit pada teks yang Anda kirim.\n\n"
+            "Kirim ulang nomor dalam format internasional, misal:\n"
             "• `+628123456789` (Indonesia)\n"
             "• `+14155552671` (US)\n"
             "• `+447911123456` (UK)\n\n"
-            "Khusus Indonesia, `08123456789` juga diterima.",
+            "Khusus Indonesia, `08123456789` juga diterima.\n\n"
+            "Atau ketik /cancel untuk membatalkan.",
             parse_mode='Markdown'
         )
         return PHONE
@@ -259,13 +302,14 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _looks_like_valid_e164(phone_number):
         await send_and_save_message(
             update, context,
-            "❌ Format nomor telepon tidak valid!\n\n"
-            "Gunakan format internasional E.164 (`+<kode_negara><nomor>`), "
-            "panjang total 8–15 digit setelah tanda `+`.\n\n"
-            "Contoh:\n"
+            "❌ *Nomor masih belum sesuai standar internasional*\n\n"
+            "Format yang diharapkan: `+<kode_negara><nomor>` "
+            "dengan total 8–15 digit setelah tanda `+`.\n\n"
+            "*Contoh benar:*\n"
             "• `+628123456789` (Indonesia)\n"
             "• `+14155552671` (US)\n"
-            "• `+447911123456` (UK)",
+            "• `+447911123456` (UK)\n\n"
+            "Kirim ulang nomornya, atau ketik /cancel untuk membatalkan.",
             parse_mode='Markdown'
         )
         return PHONE
@@ -273,8 +317,10 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await send_and_save_message(
             update, context,
-            "⏳ Memproses nomor telepon...\n"
-            "Mohon tunggu sebentar..."
+            "⏳ *Memproses nomor…*\n\n"
+            f"Menghubungkan ke server Telegram untuk akun `{escape_markdown(phone_number, version=1)}`.\n"
+            "Mohon tunggu beberapa detik.",
+            parse_mode='Markdown',
         )
 
         # Buat TelethonAuth instance
@@ -286,15 +332,14 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # - kalau belum authorized → otomatis `send_code_request` lalu return False.
         connected = await auth.connect()
         if connected:
+            # Akun sudah authorized berkat file session lama yang masih valid.
             try:
                 me = await auth.get_me()
                 await send_and_save_message(
                     update, context,
-                    f"✅ **Login berhasil!**\n\n"
-                    f"👤 Nama: {escape_markdown(me.first_name or 'N/A', version=1)}\n"
-                    f"📱 Nomor: {escape_markdown(phone_number, version=1)}\n"
-                    f"🆔 ID: `{me.id}`\n\n"
-                    f"Session tersimpan di: `{escape_markdown(_format_session_saved_path(phone_number), version=1)}`",
+                    _login_success_text(phone_number, me)
+                    + "\n\nℹ️ Tidak perlu OTP karena session lama untuk nomor "
+                      "ini masih valid.",
                     parse_mode='Markdown'
                 )
             finally:
@@ -317,46 +362,68 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # bagian dari `connect()`. Kalau file session lama ada tapi sudah
         # revoked, beri tahu user terus terang.
         had_stale_session = auth.is_session_exists()
-        prompt_lines = [
-            "✅ Kode OTP telah dikirim ke Telegram Anda!\n",
+        intro_lines = [
+            "📨 *Kode OTP terkirim*\n",
+            f"Telegram baru saja mengirim kode 5 digit ke akun "
+            f"`{escape_markdown(phone_number, version=1)}` "
+            "(via app Telegram, bukan SMS).\n",
         ]
         if had_stale_session:
-            prompt_lines.append(
-                "ℹ️ Session lama untuk nomor ini ditemukan tetapi **tidak valid lagi**; "
-                "perlu otentikasi ulang dengan OTP\\.\n"
+            intro_lines.append(
+                "ℹ️ Session lama untuk nomor ini ditemukan tapi sudah tidak "
+                "valid lagi. Diperlukan login ulang dengan OTP.\n"
             )
-        prompt_lines.extend([
-            "📱 **Langkah 2: Kode OTP**\n",
-            "Silakan kirim kode OTP yang Anda terima.",
-            "Format: 12345 (5 digit angka)\n",
-            "💡 **Tips:**",
-            "- Kode OTP berlaku selama 5 menit",
-            "- Jika tidak menerima kode, gunakan /resend",
-            "- Gunakan /cancel untuk membatalkan",
-        ])
+        body_lines = [
+            "🔢 *Langkah 2/3 — Kode OTP*\n",
+            "Kirim kode OTP yang Anda terima ke chat ini.",
+            "Format: 5 digit angka, contoh `12345`.\n",
+            "💡 *Tips:*",
+            "• Buka aplikasi Telegram resmi → cek pesan masuk dari akun "
+            "`Telegram` atau notifikasi *Login Code*.",
+            "• Kode OTP berlaku ~5 menit. Bila kedaluwarsa, ketik /resend.",
+            "• Bila tidak menerima kode dalam 1–2 menit, ketik /resend.",
+            "• Ketik /cancel untuk membatalkan.",
+            "• Diam selama 3 menit → login dibatalkan otomatis.",
+        ]
         await send_and_save_message(
             update, context,
-            "\n".join(prompt_lines),
+            "\n".join(intro_lines + body_lines),
             parse_mode='Markdown'
         )
         return OTP
 
     except Exception as e:
         error_msg = str(e)
-        if "all available options" in error_msg.lower() or "resendcode" in error_msg.lower():
-            await send_and_save_message(
-                update, context,
-                "⚠️ **Semua metode verifikasi sudah digunakan**\n\n"
-                "Silakan tunggu beberapa saat, lalu gunakan /login lagi untuk meminta kode OTP baru.\n\n"
-                "Atau gunakan /cancel untuk membatalkan.",
-                parse_mode='Markdown'
+        low = error_msg.lower()
+        if "all available options" in low or "resendcode" in low:
+            friendly = (
+                "⚠️ *Semua metode pengiriman OTP sudah dipakai*\n\n"
+                "Telegram membatasi pengiriman kode untuk nomor ini sementara waktu. "
+                "Tunggu beberapa menit, lalu ketik /login lagi untuk minta kode baru.\n\n"
+                "Atau ketik /cancel untuk membatalkan."
+            )
+        elif "flood" in low or "wait of" in low:
+            friendly = (
+                "⏳ *Terkena FloodWait dari Telegram*\n\n"
+                f"Pesan asli: `{escape_markdown(error_msg, version=1)}`\n\n"
+                "Tunggu durasi yang disebutkan di pesan asli lalu ketik /login lagi. "
+                "Atau ketik /cancel untuk membatalkan."
+            )
+        elif "phone_number" in low and ("invalid" in low or "banned" in low):
+            friendly = (
+                "❌ *Nomor ditolak Telegram*\n\n"
+                f"Pesan asli: `{escape_markdown(error_msg, version=1)}`\n\n"
+                "Pastikan nomor yang Anda kirim benar-benar terdaftar di Telegram "
+                "dan tidak diblokir. Ketik /login untuk coba nomor lain, atau "
+                "/cancel untuk membatalkan."
             )
         else:
-            await send_and_save_message(
-                update, context,
-                f"❌ Error: {error_msg}\n\n"
-                "Silakan coba lagi atau gunakan /cancel untuk membatalkan."
+            friendly = (
+                "❌ *Gagal memproses nomor*\n\n"
+                f"Pesan asli: `{escape_markdown(error_msg, version=1)}`\n\n"
+                "Ketik /login untuk mencoba lagi, atau /cancel untuk membatalkan."
             )
+        await send_and_save_message(update, context, friendly, parse_mode='Markdown')
         # Hanya disconnect — JANGAN hapus file session di sini. File session
         # tersimpan hanya setelah sign_in sukses; pada tahap ini biasanya belum
         # ada. Jika file lama dari nomor yang sama kebetulan ada, ia ditangani
@@ -378,9 +445,7 @@ async def receive_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -396,45 +461,47 @@ async def receive_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_auths:
         await send_and_save_message(
             update, context,
-            "❌ Session tidak ditemukan. Silakan mulai dari /login"
+            "⚠️ *Sesi login tidak ditemukan*\n\n"
+            "Mungkin Anda belum memulai /login, atau prosesnya sudah dibatalkan "
+            "(karena /cancel, error, atau timeout 3 menit).\n\n"
+            "Ketik /login untuk memulai dari awal.",
+            parse_mode='Markdown',
         )
         return ConversationHandler.END
-    
+
     auth = user_auths[user_id]
-    
-    # Validasi OTP (harus angka)
+
+    # Validasi OTP harus angka.
     if not otp_code.isdigit():
         await send_and_save_message(
             update, context,
-            "❌ Kode OTP harus berupa angka!\n\n"
-            "Silakan kirim kode OTP yang valid."
+            "❌ *Kode OTP harus angka saja*\n\n"
+            "Format: 5 digit angka, contoh `12345`.\n"
+            "Hapus spasi/strip/huruf, lalu kirim ulang.\n\n"
+            "Ketik /resend untuk minta kode baru, atau /cancel untuk membatalkan.",
+            parse_mode='Markdown',
         )
         return OTP
-    
+
     try:
         await send_and_save_message(
             update, context,
-            "⏳ Memverifikasi kode OTP...\n"
-            "Mohon tunggu sebentar..."
+            "⏳ *Memverifikasi kode OTP…*\n\n"
+            "Mengirim kode ke server Telegram. Mohon tunggu sebentar.",
+            parse_mode='Markdown',
         )
-        
+
         success, message = await auth.sign_in(otp_code=otp_code)
-        
+
         if success:
-            # Login berhasil
             try:
                 me = await auth.get_me()
                 await send_and_save_message(
                     update, context,
-                    f"✅ **Login berhasil!**\n\n"
-                    f"👤 Nama: {escape_markdown(me.first_name or 'N/A', version=1)}\n"
-                    f"📱 Nomor: {escape_markdown(auth.phone_number, version=1)}\n"
-                    f"🆔 ID: `{me.id}`\n\n"
-                    f"Session tersimpan di: `{escape_markdown(_format_session_saved_path(auth.phone_number), version=1)}`",
+                    _login_success_text(auth.phone_number, me),
                     parse_mode='Markdown'
                 )
             finally:
-                # Pastikan disconnect bahkan jika ada error saat get_me
                 try:
                     await auth.disconnect()
                 except Exception:
@@ -445,49 +512,81 @@ async def receive_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 get_ordered_session_phones()
             except Exception:
                 pass
-            # Reset last_bot_message_id agar pesan login berhasil tidak dihapus
             context.user_data['last_bot_message_id'] = None
             return ConversationHandler.END
         else:
             if "Password diperlukan" in message or "password" in message.lower():
                 await send_and_save_message(
                     update, context,
-                    "🔐 **Langkah 3: Password 2FA**\n\n"
-                    "Akun Anda menggunakan Two-Factor Authentication (2FA).\n"
-                    "Silakan kirim password 2FA Anda.\n\n"
-                    "Gunakan /cancel untuk membatalkan.",
+                    "🔐 *Langkah 3/3 — Password 2FA (Two-Step Verification)*\n\n"
+                    "Akun ini mengaktifkan *Two-Step Verification*. Kirim "
+                    "*Cloud Password* Anda — yaitu password yang Anda set di "
+                    "Telegram (Settings → Privacy and Security → Two-Step "
+                    "Verification), *bukan* password media sosial atau email.\n\n"
+                    "💡 *Tips:*\n"
+                    "• Kalau lupa password 2FA, Anda bisa mereset lewat email "
+                    "pemulihan di app Telegram resmi.\n"
+                    "• Bot akan menghapus pesan password Anda dari chat untuk "
+                    "alasan keamanan.\n"
+                    "• Ketik /cancel untuk membatalkan.\n"
+                    "• Diam selama 3 menit → login dibatalkan otomatis.",
                     parse_mode='Markdown'
                 )
                 return PASSWORD
             elif message == "RESEND_NEEDED":
                 await send_and_save_message(
                     update, context,
-                    "⚠️ **Semua metode verifikasi sudah digunakan**\n\n"
-                    "Silakan gunakan /resend untuk meminta kode OTP baru.\n\n"
-                    "Atau gunakan /cancel untuk membatalkan.",
+                    "⚠️ *Semua metode verifikasi OTP sudah dipakai*\n\n"
+                    "Ketik /resend untuk meminta kode OTP baru, atau /cancel "
+                    "untuk membatalkan.",
                     parse_mode='Markdown'
                 )
                 return OTP
             else:
+                low = (message or "").lower()
+                if "expired" in low or "phonecodeexpired" in low:
+                    detail = (
+                        "Kode OTP sudah kedaluwarsa.\n"
+                        "Ketik /resend untuk minta kode baru."
+                    )
+                elif "invalid" in low or "phonecodeinvalid" in low:
+                    detail = (
+                        "Kode OTP yang Anda kirim tidak cocok.\n"
+                        "Periksa lagi 5 digit yang Telegram kirim, lalu kirim ulang.\n"
+                        "Jika sudah hilang, ketik /resend."
+                    )
+                else:
+                    detail = (
+                        f"Pesan dari Telegram: `{escape_markdown(message, version=1)}`\n"
+                        "Coba kirim ulang OTP, atau /resend untuk kode baru."
+                    )
                 await send_and_save_message(
                     update, context,
-                    f"❌ {escape_markdown(message, version=1)}\n\n"
-                    "💡 **Tips:**\n"
-                    "- Pastikan kode OTP masih valid (biasanya 5 menit)\n"
-                    "- Jika kode sudah kedaluwarsa, gunakan /resend\n"
-                    "- Atau gunakan /cancel untuk membatalkan.",
+                    "❌ *Verifikasi OTP gagal*\n\n"
+                    f"{detail}\n\n"
+                    "Ketik /cancel untuk membatalkan.",
                     parse_mode='Markdown'
                 )
                 return OTP
-                
+
     except Exception as e:
-        await send_and_save_message(
-            update, context,
-            f"❌ Error: {str(e)}\n\n"
-            "Silakan coba lagi atau gunakan /cancel untuk membatalkan."
-        )
-        # Error saat verifikasi OTP — tetap stay di state OTP. Jangan hapus
-        # file session di sini (lihat catatan di receive_phone).
+        msg = str(e)
+        low = msg.lower()
+        if "flood" in low or "wait of" in low:
+            friendly = (
+                "⏳ *FloodWait dari Telegram saat verifikasi OTP*\n\n"
+                f"Pesan asli: `{escape_markdown(msg, version=1)}`\n\n"
+                "Tunggu durasi tersebut sebelum mencoba lagi. Bisa juga ketik "
+                "/cancel untuk membatalkan sekarang."
+            )
+        else:
+            friendly = (
+                "❌ *Gagal memverifikasi OTP*\n\n"
+                f"Pesan asli: `{escape_markdown(msg, version=1)}`\n\n"
+                "Kirim ulang kode, atau /resend untuk minta kode baru, atau "
+                "/cancel untuk membatalkan."
+            )
+        await send_and_save_message(update, context, friendly, parse_mode='Markdown')
         return OTP
 
 
@@ -498,9 +597,7 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -516,36 +613,35 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_auths:
         await send_and_save_message(
             update, context,
-            "❌ Session tidak ditemukan. Silakan mulai dari /login"
+            "⚠️ *Sesi login tidak ditemukan*\n\n"
+            "Mungkin proses login sudah dibatalkan (karena /cancel, error, "
+            "atau timeout 3 menit).\n\n"
+            "Ketik /login untuk memulai dari awal.",
+            parse_mode='Markdown',
         )
         return ConversationHandler.END
-    
+
     auth = user_auths[user_id]
-    
+
     try:
         await send_and_save_message(
             update, context,
-            "⏳ Memverifikasi password...\n"
-            "Mohon tunggu sebentar..."
+            "⏳ *Memverifikasi password 2FA…*\n\n"
+            "Mengirim password ke server Telegram. Mohon tunggu sebentar.",
+            parse_mode='Markdown',
         )
-        
+
         success, message = await auth.sign_in(password=password)
-        
+
         if success:
-            # Login berhasil
             try:
                 me = await auth.get_me()
                 await send_and_save_message(
                     update, context,
-                    f"✅ **Login berhasil!**\n\n"
-                    f"👤 Nama: {escape_markdown(me.first_name or 'N/A', version=1)}\n"
-                    f"📱 Nomor: {escape_markdown(auth.phone_number, version=1)}\n"
-                    f"🆔 ID: `{me.id}`\n\n"
-                    f"Session tersimpan di: `{escape_markdown(_format_session_saved_path(auth.phone_number), version=1)}`",
+                    _login_success_text(auth.phone_number, me),
                     parse_mode='Markdown'
                 )
             finally:
-                # Pastikan disconnect bahkan jika ada error saat get_me
                 try:
                     await auth.disconnect()
                 except Exception:
@@ -556,25 +652,37 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 get_ordered_session_phones()
             except Exception:
                 pass
-            # Reset last_bot_message_id agar pesan login berhasil tidak dihapus
             context.user_data['last_bot_message_id'] = None
             return ConversationHandler.END
         else:
             await send_and_save_message(
                 update, context,
-                f"❌ {escape_markdown(message, version=1)}\n\n"
-                "Silakan coba lagi atau gunakan /cancel untuk membatalkan.",
+                "❌ *Password 2FA salah*\n\n"
+                f"Pesan dari Telegram: `{escape_markdown(message, version=1)}`\n\n"
+                "Kirim ulang Cloud Password Anda (pastikan huruf besar/kecil "
+                "dan karakter khusus benar).\n"
+                "Ketik /cancel untuk membatalkan.",
                 parse_mode='Markdown'
             )
             return PASSWORD
 
     except Exception as e:
-        await send_and_save_message(
-            update, context,
-            f"❌ Error: {str(e)}\n\n"
-            "Silakan coba lagi atau gunakan /cancel untuk membatalkan."
-        )
-        # Stay di state PASSWORD; jangan menghapus file session di sini.
+        msg = str(e)
+        low = msg.lower()
+        if "flood" in low or "wait of" in low:
+            friendly = (
+                "⏳ *FloodWait dari Telegram saat verifikasi password*\n\n"
+                f"Pesan asli: `{escape_markdown(msg, version=1)}`\n\n"
+                "Tunggu durasi tersebut sebelum mencoba lagi, atau ketik "
+                "/cancel untuk membatalkan."
+            )
+        else:
+            friendly = (
+                "❌ *Gagal memverifikasi password 2FA*\n\n"
+                f"Pesan asli: `{escape_markdown(msg, version=1)}`\n\n"
+                "Kirim ulang password, atau /cancel untuk membatalkan."
+            )
+        await send_and_save_message(update, context, friendly, parse_mode='Markdown')
         return PASSWORD
 
 
@@ -585,52 +693,61 @@ async def resend_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
 
     if user_id not in user_auths:
         await update.message.reply_text(
-            "❌ Session tidak ditemukan. Silakan mulai dari /login"
+            "⚠️ *Sesi login tidak ditemukan*\n\n"
+            "/resend hanya bisa dipakai saat bot sedang menunggu OTP dari Anda.\n"
+            "Ketik /login untuk memulai proses login.",
+            parse_mode='Markdown',
         )
         return ConversationHandler.END
-    
+
     auth = user_auths[user_id]
-    
+
     try:
         await send_and_save_message(
             update, context,
-            "⏳ Mengirim ulang kode OTP...\n"
-            "Mohon tunggu sebentar..."
+            "⏳ *Mengirim ulang kode OTP…*\n\n"
+            "Meminta Telegram mengirimkan kode baru. Mohon tunggu sebentar.",
+            parse_mode='Markdown',
         )
-        
+
         success, message = await auth.resend_code()
-        
+
         if success:
             await send_and_save_message(
                 update, context,
-                "✅ **Kode OTP baru telah dikirim!**\n\n"
-                "📱 Silakan cek Telegram Anda dan kirim kode OTP yang baru.\n\n"
-                "Gunakan /cancel untuk membatalkan.",
+                "✅ *Kode OTP baru terkirim*\n\n"
+                f"Cek app Telegram Anda di akun `{escape_markdown(auth.phone_number, version=1)}` "
+                "untuk pesan dari `Telegram` / notifikasi *Login Code*.\n\n"
+                "Kirim 5 digit angka itu ke chat ini. Format: `12345`.\n"
+                "Ketik /cancel untuk membatalkan.",
                 parse_mode='Markdown'
             )
             return OTP
         else:
             await send_and_save_message(
                 update, context,
-                f"❌ {message}\n\n"
-                "Silakan coba lagi atau gunakan /cancel untuk membatalkan."
+                "❌ *Gagal mengirim ulang OTP*\n\n"
+                f"Pesan dari Telegram: `{escape_markdown(message or '(tanpa detail)', version=1)}`\n\n"
+                "Tunggu beberapa saat lalu coba /resend lagi, atau ketik "
+                "/cancel untuk membatalkan.",
+                parse_mode='Markdown',
             )
             return OTP
-            
+
     except Exception as e:
         await send_and_save_message(
             update, context,
-            f"❌ Error: {str(e)}\n\n"
-            "Silakan coba lagi atau gunakan /cancel untuk membatalkan."
+            "❌ *Error saat mengirim ulang OTP*\n\n"
+            f"Pesan asli: `{escape_markdown(str(e), version=1)}`\n\n"
+            "Coba /resend lagi, atau /cancel untuk membatalkan.",
+            parse_mode='Markdown',
         )
         return OTP
 
@@ -642,9 +759,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah user adalah admin
     if not is_admin(user_id):
         await update.message.reply_text(
-            "❌ **Akses Ditolak**\n\n"
-            "Anda tidak memiliki izin untuk menggunakan bot ini.\n"
-            "Silakan hubungi administrator untuk mendapatkan akses.",
+            ACCESS_DENIED_TEXT,
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -675,7 +790,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_last_message(update, context)
 
     await update.message.reply_text(
-        "❌ Proses login dibatalkan.",
+        "🛑 *Proses login dibatalkan*\n\n"
+        "Anda dapat memulai lagi kapan saja dengan /login.",
+        parse_mode='Markdown',
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
@@ -717,9 +834,10 @@ async def login_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "⏰ **Proses login dibatalkan**\n\n"
-                    f"Tidak ada aktivitas selama {LOGIN_IDLE_TIMEOUT_SECS // 60} menit. "
-                    "Silakan kirim /login lagi bila ingin mengulang."
+                    "⏰ *Proses login dibatalkan otomatis*\n\n"
+                    f"Tidak ada balasan apa pun selama "
+                    f"{LOGIN_IDLE_TIMEOUT_SECS // 60} menit.\n\n"
+                    "Ketik /login untuk memulai lagi dari awal."
                 ),
                 parse_mode='Markdown',
             )
