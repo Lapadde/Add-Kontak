@@ -1191,6 +1191,7 @@ async def _run_manage_scrape_all_sessions_core(
             "phone": phone,
             "invited": 0,
             "flood_wait_seconds": None,
+            "peer_flood": False,
             "return_chunk": [],
             "note": None,
             "failed_sample": [],
@@ -1228,6 +1229,7 @@ async def _run_manage_scrape_all_sessions_core(
             )
             out["invited"] = int(sub.get("invited") or 0)
             out["flood_wait_seconds"] = sub.get("flood_wait_seconds")
+            out["peer_flood"] = bool(sub.get("peer_flood"))
             out["failed_sample"] = list(sub.get("failed_sample") or [])
             rem_local = sub.get("remaining_users") or []  # User-versi-phone-ini
             rem_scraper = []
@@ -1337,11 +1339,18 @@ async def _run_manage_scrape_all_sessions_core(
                 record_invite_flood(fp, int(fw))
                 phones_active.discard(fp)
                 wave_flood.append((fp, int(fw)))
-                flooded_skip_notes.append(
-                    f"`{escape_markdown(str(fp), version=1)}` "
-                    f"\\(FloodWait \\~{int(fw)}s \\> {FLOOD_WAIT_ABORT_ABOVE_SEC // 60} m\\) "
-                    f"— di\\-skip, lainnya lanjut"
-                )
+                if r.get("peer_flood"):
+                    flooded_skip_notes.append(
+                        f"`{escape_markdown(str(fp), version=1)}` "
+                        f"\\(PeerFlood / anti\\-spam Telegram\\) "
+                        f"— akun dihentikan, lainnya lanjut"
+                    )
+                else:
+                    flooded_skip_notes.append(
+                        f"`{escape_markdown(str(fp), version=1)}` "
+                        f"\\(FloodWait \\~{int(fw)}s \\> {FLOOD_WAIT_ABORT_ABOVE_SEC // 60} m\\) "
+                        f"— di\\-skip, lainnya lanjut"
+                    )
 
         # Requeue user yang dikembalikan, kecuali sudah gagal terlalu sering.
         for u in reversed(wave_returned_users):
