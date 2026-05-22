@@ -12,6 +12,7 @@ from telethon.errors import (
     UserAlreadyParticipantError,
     UserNotParticipantError,
     ChatAdminRequiredError,
+    PeerFloodError,
 )
 from telethon.tl.functions.channels import (
     JoinChannelRequest,
@@ -52,6 +53,23 @@ logger = logging.getLogger(__name__)
 NON_MUTUAL_INVITE_DELAY_SEC = 5.0
 # FloodWait di atas ini (detik) menghentikan undangan; di bawah/sama: tunggu lalu ulangi request
 FLOOD_WAIT_ABORT_ABOVE_SEC = 300  # 5 menit
+# Saat PeerFloodError (anti-spam permanen) → ditandai dengan sentinel ini supaya
+# pemanggil mengeluarkan akun dari pool. Nilainya >> FLOOD_WAIT_ABORT_ABOVE_SEC.
+PEER_FLOOD_COOLDOWN_SEC = 24 * 60 * 60  # 24 jam
+
+
+def _is_updates_parsing_bug(exc: BaseException) -> bool:
+    """True bila exception ini adalah bug Telethon "'Updates' object is not iterable".
+
+    Bug terjadi di internal updater Telethon ketika memproses respons RPC
+    tertentu. Request ke server BIASANYA sudah diterima Telegram (user
+    kemungkinan besar berhasil diundang). Kita perlakukan sebagai sukses agar
+    user tidak di-drop tanpa alasan.
+    """
+    if not isinstance(exc, TypeError):
+        return False
+    msg = str(exc).lower()
+    return "updates" in msg and "not iterable" in msg
 # Jika grup sumber menyembunyikan member, fallback baca riwayat pesan & ambil pengirim unik.
 # Default tetap (tidak dapat diubah dari UI admin).
 HIDDEN_MEMBERS_MSG_FALLBACK_LIMIT = 1000
@@ -1261,6 +1279,52 @@ class TelethonAuth:
                             "flood_wait_seconds": stop_sec,
                             "remaining_users": list(users[i:]),
                         }
+                except PeerFloodError:
+                    # Akun ditandai anti-spam oleh Telegram. Berhenti total untuk
+                    # session ini agar pemanggil mengeluarkannya dari pool aktif.
+                    return {
+                        "invited": invited,
+                        "flood_wait_seconds": PEER_FLOOD_COOLDOWN_SEC,
+                        "remaining_users": list(users[i:]),
+                        "peer_flood": True,
+                    }
+                except TypeError as te:
+                    if _is_updates_parsing_bug(te):
+                        # Request kemungkinan besar sukses; Telethon hanya gagal
+                        # mem-parse respons. Hitung sebagai berhasil agar batch
+                        # tidak diulang.
+                        invited += len(batch)
+                        batch_confirmed = True
+                        if inter_contact_delay > 0:
+                            await asyncio.sleep(inter_contact_delay)
+                        continue
+                    # TypeError lain → jatuh ke per-user fallback.
+                    for j, u in enumerate(batch):
+                        user_done = False
+                        while not user_done:
+                            try:
+                                res = await self.client(
+                                    InviteToChannelRequest(channel=entity, users=[u])
+                                )
+                                invited += _count_invited_users_from_invite_updates(res, [u])
+                                user_done = True
+                            except TypeError as te2:
+                                if _is_updates_parsing_bug(te2):
+                                    invited += 1
+                                    user_done = True
+                                else:
+                                    await record_fail(u.id, str(te2))
+                                    user_done = True
+                            except Exception as ee:
+                                await record_fail(u.id, str(ee))
+                                user_done = True
+                            delay = (
+                                inter_contact_delay
+                                if inter_contact_delay > 0
+                                else 0.15
+                            )
+                            await asyncio.sleep(delay)
+                    batch_confirmed = True
                 except Exception:
                     for j, u in enumerate(batch):
                         user_done = False
@@ -1287,6 +1351,15 @@ class TelethonAuth:
                                         "remaining_users": list(tail)
                                         + list(users[i + len(batch) :]),
                                     }
+                            except PeerFloodError:
+                                tail = batch[j:] if j < len(batch) else []
+                                return {
+                                    "invited": invited,
+                                    "flood_wait_seconds": PEER_FLOOD_COOLDOWN_SEC,
+                                    "remaining_users": list(tail)
+                                    + list(users[i + len(batch) :]),
+                                    "peer_flood": True,
+                                }
                             except UserAlreadyParticipantError:
                                 # Sudah ada di grup → anggap "sudah masuk".
                                 invited += 1
@@ -1297,6 +1370,25 @@ class TelethonAuth:
                                     else 0.15
                                 )
                                 await asyncio.sleep(delay)
+                            except TypeError as te3:
+                                if _is_updates_parsing_bug(te3):
+                                    invited += 1
+                                    user_done = True
+                                    delay = (
+                                        inter_contact_delay
+                                        if inter_contact_delay > 0
+                                        else 0.15
+                                    )
+                                    await asyncio.sleep(delay)
+                                    continue
+                                await record_fail(u.id, str(te3))
+                                delay = (
+                                    inter_contact_delay
+                                    if inter_contact_delay > 0
+                                    else 0.15
+                                )
+                                await asyncio.sleep(delay)
+                                user_done = True
                             except Exception as ee:
                                 el = str(ee).lower()
                                 if (
@@ -1311,6 +1403,18 @@ class TelethonAuth:
                                     )
                                     await asyncio.sleep(delay)
                                     continue
+                                # "Too many requests" tanpa class PeerFloodError
+                                # (mis. RPCError generic dari Telegram) → tetap
+                                # diperlakukan sebagai anti-spam → hentikan akun.
+                                if "too many requests" in el or "peer_flood" in el:
+                                    tail = batch[j:] if j < len(batch) else []
+                                    return {
+                                        "invited": invited,
+                                        "flood_wait_seconds": PEER_FLOOD_COOLDOWN_SEC,
+                                        "remaining_users": list(tail)
+                                        + list(users[i + len(batch) :]),
+                                        "peer_flood": True,
+                                    }
                                 await record_fail(u.id, str(ee))
                                 delay = (
                                     inter_contact_delay
@@ -1360,7 +1464,33 @@ class TelethonAuth:
                             "flood_wait_seconds": stop_sec,
                             "remaining_users": list(users[idx_u:]),
                         }
+                except PeerFloodError:
+                    return {
+                        "invited": invited,
+                        "flood_wait_seconds": PEER_FLOOD_COOLDOWN_SEC,
+                        "remaining_users": list(users[idx_u:]),
+                        "peer_flood": True,
+                    }
+                except UserAlreadyParticipantError:
+                    invited += 1
+                    user_done = True
+                except TypeError as te:
+                    if _is_updates_parsing_bug(te):
+                        # Telethon parsing bug — request kemungkinan sukses.
+                        invited += 1
+                        user_done = True
+                    else:
+                        await record_fail(u.id, str(te))
+                        user_done = True
                 except Exception as ee:
+                    el = str(ee).lower()
+                    if "too many requests" in el or "peer_flood" in el:
+                        return {
+                            "invited": invited,
+                            "flood_wait_seconds": PEER_FLOOD_COOLDOWN_SEC,
+                            "remaining_users": list(users[idx_u:]),
+                            "peer_flood": True,
+                        }
                     await record_fail(u.id, str(ee))
                     user_done = True
             await asyncio.sleep(inter_contact_delay)
