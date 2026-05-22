@@ -1174,6 +1174,13 @@ async def _run_manage_scrape_all_sessions_core(
     no_progress_streak = 0
     NO_PROGRESS_BREAK = 5
     last_wave_note = None
+    # Dua counter terpisah:
+    # - `session_attempted_count`: hard-cap budget (cara hitung: jumlah user yang
+    #   benar-benar dikirim ke Telegram, dihitung saat chunk dirakit & di-refund
+    #   bila chunk dikembalikan oleh wave). Ini yang dipakai untuk **enforce cap**.
+    # - `session_invited_count`: jumlah undangan **sukses** menurut laporan Telegram
+    #   (UpdateChannelParticipant), dipakai hanya untuk tampilan ringkasan.
+    session_attempted_count = {p: 0 for p in phones_ok}
     session_invited_count = {p: 0 for p in phones_ok}
     session_capped_phones = set()  # session yang sudah mencapai cap
 
@@ -1242,9 +1249,11 @@ async def _run_manage_scrape_all_sessions_core(
             break
         assignments = []
         for phone in active_list:
-            # Hitung sisa kuota per session jika cap aktif.
+            # Hitung sisa kuota per session jika cap aktif. Pakai counter "attempted"
+            # supaya cap menjadi HARD limit, terlepas dari apakah Telegram melaporkan
+            # sukses lewat update (kadang under-reported).
             if per_session_cap > 0:
-                remaining_cap = per_session_cap - session_invited_count.get(phone, 0)
+                remaining_cap = per_session_cap - session_attempted_count.get(phone, 0)
                 if remaining_cap <= 0:
                     phones_active.discard(phone)
                     session_capped_phones.add(phone)
@@ -1258,6 +1267,12 @@ async def _run_manage_scrape_all_sessions_core(
                     chunk.append(q.popleft())
             if chunk:
                 assignments.append((phone, chunk))
+                # Reserve budget upfront. Bagian yang dikembalikan oleh wave (mis.
+                # tidak ada di peer cache / FloodWait stop) akan di-refund di bawah.
+                if per_session_cap > 0:
+                    session_attempted_count[phone] = (
+                        session_attempted_count.get(phone, 0) + len(chunk)
+                    )
         if not assignments:
             break
 
@@ -1280,6 +1295,14 @@ async def _run_manage_scrape_all_sessions_core(
             ret_chunk = r.get("return_chunk") or []
             if ret_chunk:
                 wave_returned_users.extend(ret_chunk)
+            # Refund budget per chunk yang dikembalikan (tidak benar-benar
+            # dikirim ke Telegram), agar cap hanya menahan user yang TRULY sent.
+            rphone = r.get("phone") or phone
+            if per_session_cap > 0 and ret_chunk:
+                session_attempted_count[rphone] = max(
+                    0,
+                    session_attempted_count.get(rphone, 0) - len(ret_chunk),
+                )
             if r.get("note"):
                 round_notes.append(
                     f"`{escape_markdown(str(r['phone']), version=1)}`: "
@@ -1289,18 +1312,18 @@ async def _run_manage_scrape_all_sessions_core(
             inv = int(r.get("invited") or 0)
             wave_invited += inv
             total_invited += inv
-            if inv > 0:
-                rphone = r.get("phone")
-                if rphone:
-                    session_invited_count[rphone] = (
-                        session_invited_count.get(rphone, 0) + inv
-                    )
-                    if (
-                        per_session_cap > 0
-                        and session_invited_count[rphone] >= per_session_cap
-                    ):
-                        phones_active.discard(rphone)
-                        session_capped_phones.add(rphone)
+            if inv > 0 and rphone:
+                session_invited_count[rphone] = (
+                    session_invited_count.get(rphone, 0) + inv
+                )
+            # Cek cap berdasar budget (HARD limit), bukan reported invited.
+            if (
+                per_session_cap > 0
+                and rphone
+                and session_attempted_count.get(rphone, 0) >= per_session_cap
+            ):
+                phones_active.discard(rphone)
+                session_capped_phones.add(rphone)
             for uid, msg in r.get("failed_sample") or []:
                 if len(rpc_fail_lines) < 14:
                     rpc_fail_lines.append(

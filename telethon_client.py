@@ -246,12 +246,20 @@ class TelethonAuth:
         return None
 
     async def disconnect(self):
-        """Memutus koneksi client"""
-        if self.client:
-            await self.client.disconnect()
+        """Memutus koneksi client. Set bendera supaya pemanggil tidak salah baca state."""
+        try:
+            if self.client:
+                await self.client.disconnect()
+        finally:
+            self.is_connected = False
 
     def is_session_exists(self):
-        """Cek apakah session sudah ada dan valid (user sudah authorized)"""
+        """True bila **file** .session ada dan isinya tampak seperti string session valid.
+
+        Catatan: cek ini hanya berbasis **keberadaan & panjang** isi file, bukan
+        validitas Telegram. Untuk verifikasi sungguhan (user masih authorized),
+        gunakan ``check_session_validity()`` setelah ``connect()``.
+        """
         # Cek file .session (berisi string session sebagai text)
         if os.path.exists(self.session_path):
             # Baca dan validasi string session
