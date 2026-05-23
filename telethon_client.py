@@ -13,6 +13,10 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError,
     PeerFloodError,
+    AuthKeyNotFound,
+    AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
+    AuthKeyError,
 )
 from telethon.tl.functions.channels import (
     JoinChannelRequest,
@@ -56,6 +60,35 @@ FLOOD_WAIT_ABORT_ABOVE_SEC = 300  # 5 menit
 # Saat PeerFloodError (anti-spam permanen) → ditandai dengan sentinel ini supaya
 # pemanggil mengeluarkan akun dari pool. Nilainya >> FLOOD_WAIT_ABORT_ABOVE_SEC.
 PEER_FLOOD_COOLDOWN_SEC = 24 * 60 * 60  # 24 jam
+
+
+def _is_auth_key_error(exc: BaseException) -> bool:
+    """True bila exception menunjukkan auth key tidak lagi valid di server.
+
+    Server bisa "melupakan" auth key kapan saja (sesuai pesan resmi Telethon).
+    Skenario ini mencakup:
+    - ``AuthKeyNotFound`` (common): server tidak mengenali key (paling sering
+      muncul saat awal connect).
+    - ``AuthKeyUnregisteredError``: key tidak terdaftar lagi (mis. user telah
+      menghentikan session ini dari Settings → Devices).
+    - ``AuthKeyDuplicatedError``: key dipakai 2 client sekaligus → server
+      otomatis invalidasi.
+    - ``AuthKeyError`` (umum / unknown auth).
+
+    Fallback: cek string error untuk kasus pesan generic dari Telethon.
+    """
+    if isinstance(
+        exc,
+        (AuthKeyNotFound, AuthKeyUnregisteredError, AuthKeyDuplicatedError, AuthKeyError),
+    ):
+        return True
+    msg = (str(exc) or "").lower()
+    return (
+        "auth_key" in msg
+        or "auth key" in msg
+        or "authkey" in msg
+        or "authorization key" in msg
+    )
 
 
 def _is_updates_parsing_bug(exc: BaseException) -> bool:
@@ -128,10 +161,79 @@ class TelethonAuth:
         self.password = None
         self.is_connected = False
 
+    def _rebuild_client_blank_session(self):
+        """Buat ulang ``self.client`` dengan StringSession kosong.
+
+        Dipakai setelah server tidak lagi mengenali auth key lama. File
+        ``.session`` di disk juga dihapus untuk mencegah load ulang key
+        yang sama lagi pada start berikutnya.
+        """
+        try:
+            if self.client is not None:
+                try:
+                    # Pastikan socket lama tertutup (sync best-effort; jika
+                    # masih async-running, abaikan errornya).
+                    if hasattr(self.client, "_sender") and self.client._sender:
+                        pass
+                except Exception:
+                    pass
+        finally:
+            self.string_session = None
+            try:
+                if os.path.exists(self.session_path):
+                    os.remove(self.session_path)
+            except Exception:
+                pass
+            self.client = TelegramClient(
+                StringSession(),
+                API_ID,
+                API_HASH,
+                connection_retries=3,
+                retry_delay=1,
+                timeout=30,
+            )
+            self.is_connected = False
+
     async def connect(self):
-        """Menghubungkan client ke Telegram"""
-        await self.client.connect()
-        if not await self.client.is_user_authorized():
+        """Menghubungkan client ke Telegram.
+
+        Bila server tidak mengenali auth key (``AuthKeyNotFound`` dan
+        kerabatnya), file session lama dihapus otomatis dan client di-recreate
+        sehingga alur login bisa dilanjutkan dengan OTP baru. Pemanggil bisa
+        mengecek bendera ``self.auth_key_reset`` untuk memberi tahu user.
+        """
+        self.auth_key_reset = False
+        try:
+            await self.client.connect()
+        except Exception as e:
+            if _is_auth_key_error(e):
+                # Server lupa key lama → bersihkan & coba connect ulang.
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                self._rebuild_client_blank_session()
+                self.auth_key_reset = True
+                await self.client.connect()
+            else:
+                raise
+
+        try:
+            authorized = await self.client.is_user_authorized()
+        except Exception as e:
+            if _is_auth_key_error(e):
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                self._rebuild_client_blank_session()
+                self.auth_key_reset = True
+                await self.client.connect()
+                authorized = False
+            else:
+                raise
+
+        if not authorized:
             await self.client.send_code_request(self.phone_number)
             return False
         self.is_connected = True
@@ -152,33 +254,39 @@ class TelethonAuth:
                     await self.client.connect()
                     self.is_connected = True
                 except Exception as e:
+                    if _is_auth_key_error(e):
+                        return False, (
+                            "Auth key tidak dikenali server (session sudah "
+                            "dilupakan / dihapus oleh Telegram). Perlu login ulang."
+                        )
                     error_msg = str(e).lower()
-                    if "unauthorized" in error_msg or "auth" in error_msg:
+                    if "unauthorized" in error_msg:
                         return False, "Session tidak valid (unauthorized)"
                     elif "timeout" in error_msg or "connection" in error_msg:
                         return False, "Timeout: Gagal terhubung ke Telegram"
                     else:
                         return False, f"Error koneksi: {str(e)}"
-            
+
             # Step 2: Filter cepat dengan is_user_authorized()
-            # Ini adalah check cepat tanpa perlu fetch data user
-            # Jika return False, langsung return invalid tanpa perlu get_me()
             try:
                 is_authorized = await self.client.is_user_authorized()
                 if not is_authorized:
                     return False, "Session tidak valid (user tidak authorized)"
             except Exception as e:
+                if _is_auth_key_error(e):
+                    return False, (
+                        "Auth key tidak dikenali server saat cek authorize. "
+                        "Perlu login ulang."
+                    )
                 error_msg = str(e).lower()
-                if "unauthorized" in error_msg or "auth" in error_msg:
+                if "unauthorized" in error_msg:
                     return False, "Session tidak valid (unauthorized)"
                 elif "flood" in error_msg:
                     return False, "Rate limit: Terlalu banyak request"
                 else:
                     return False, f"Error cek authorization: {str(e)}"
-            
+
             # Step 3: Validasi final dengan get_me()
-            # Hanya dipanggil jika is_user_authorized() return True
-            # Ini memastikan session benar-benar valid dan bisa digunakan
             try:
                 me = await self.client.get_me()
                 if me:
@@ -186,15 +294,24 @@ class TelethonAuth:
                 else:
                     return False, "Tidak dapat mengambil informasi user"
             except Exception as e:
+                if _is_auth_key_error(e):
+                    return False, (
+                        "Auth key tidak dikenali server saat validasi user. "
+                        "Perlu login ulang."
+                    )
                 error_msg = str(e).lower()
-                if "unauthorized" in error_msg or "auth" in error_msg:
+                if "unauthorized" in error_msg:
                     return False, "Session tidak valid (unauthorized)"
                 elif "flood" in error_msg:
                     return False, "Rate limit: Terlalu banyak request"
                 else:
                     return False, f"Error validasi: {str(e)}"
         except Exception as e:
-            # Catch-all untuk error yang tidak terduga
+            if _is_auth_key_error(e):
+                return False, (
+                    "Auth key tidak dikenali server. Session lama tidak "
+                    "berlaku lagi; perlu login ulang."
+                )
             error_msg = str(e).lower()
             if "unauthorized" in error_msg:
                 return False, "Session tidak valid (unauthorized)"

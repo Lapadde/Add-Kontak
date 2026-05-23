@@ -1000,13 +1000,17 @@ async def _run_manage_scrape_all_sessions_core(
     # objek User dengan access_hash valid bagi akun itu sendiri.
     async def _join_one_session(phone: str):
         auth = TelethonAuth(phone)
-        opened = False
+        # `keep_open=True` HANYA dipakai pada cabang sukses (auth dimasukkan ke
+        # `auth_pool` untuk dipakai oleh undangan). Semua cabang kegagalan
+        # MUST membiarkan finally menutup socket agar tidak bocor.
+        keep_open = False
         try:
             if not auth.is_session_exists():
                 return phone, False, f"`{escape_markdown(phone, version=1)}` — tidak ada file", None
             if not await auth.connect():
+                # `connect()` False ⇒ socket sudah dibuka & send_code_request
+                # terkirim. Wajib di-disconnect (lewat finally) agar tidak bocor.
                 return phone, False, f"`{escape_markdown(phone, version=1)}` — belum login", None
-            opened = True
             loc_src, e1 = await auth.resolve_group_entity_for_invite(source_link)
             loc_tgt, e2 = await auth.resolve_group_entity_for_invite(target_link)
             if e1 or e2:
@@ -1030,6 +1034,7 @@ async def _run_manage_scrape_all_sessions_core(
             users_by_id, prime_mode, prime_note = await auth._collect_user_pool(
                 loc_src, participants_limit=5000
             )
+            keep_open = True  # auth diserahkan ke auth_pool; jangan disconnect di finally.
             return phone, True, None, {
                 "auth": auth,
                 "src": loc_src,
@@ -1039,17 +1044,18 @@ async def _run_manage_scrape_all_sessions_core(
                 "prime_note": prime_note,
             }
         except Exception as ex:
-            if opened:
-                try:
-                    await auth.disconnect()
-                except Exception:
-                    pass
             return (
                 phone,
                 False,
                 f"`{escape_markdown(phone, version=1)}` — {escape_markdown(str(ex)[:80], version=1)}",
                 None,
             )
+        finally:
+            if not keep_open:
+                try:
+                    await auth.disconnect()
+                except Exception:
+                    pass
 
     n_ph = len(phones)
     await _progress_edit(
@@ -2757,7 +2763,8 @@ async def download_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Download session file"""
     query = update.callback_query
     await query.answer()
-    
+
+    auth = None
     try:
         phone = query.data.split(":")[1]
         auth = TelethonAuth(phone)
@@ -2814,6 +2821,14 @@ async def download_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except Exception as e:
         await query.edit_message_text(f"❌ Error: {escape_markdown(str(e), version=1)}", parse_mode='Markdown')
+    finally:
+        # Walau download_session tidak panggil connect(), tetap disconnect
+        # untuk antisipasi kalau alur ke depan menambahkan call yang membuka socket.
+        if auth:
+            try:
+                await auth.disconnect()
+            except Exception:
+                pass
 
 
 async def get_string_session(update: Update, context: ContextTypes.DEFAULT_TYPE):

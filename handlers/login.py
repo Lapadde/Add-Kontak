@@ -360,15 +360,24 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # `connected == False` → OTP sudah dikirim oleh `send_code_request`
         # bagian dari `connect()`. Kalau file session lama ada tapi sudah
-        # revoked, beri tahu user terus terang.
+        # revoked / dilupakan server, beri tahu user terus terang.
         had_stale_session = auth.is_session_exists()
+        auth_key_was_reset = getattr(auth, "auth_key_reset", False)
         intro_lines = [
             "📨 *Kode OTP terkirim*\n",
             f"Telegram baru saja mengirim kode 5 digit ke akun "
             f"`{escape_markdown(phone_number, version=1)}` "
             "(via app Telegram, bukan SMS).\n",
         ]
-        if had_stale_session:
+        if auth_key_was_reset:
+            intro_lines.append(
+                "♻️ Server Telegram sudah tidak mengenali auth key dari "
+                "session lama untuk nomor ini (kemungkinan session "
+                "dihapus dari Settings → Devices atau dilupakan server). "
+                "File session lama dibersihkan otomatis; lanjutkan dengan "
+                "OTP baru di bawah ini.\n"
+            )
+        elif had_stale_session:
             intro_lines.append(
                 "ℹ️ Session lama untuk nomor ini ditemukan tapi sudah tidak "
                 "valid lagi. Diperlukan login ulang dengan OTP.\n"
@@ -395,7 +404,31 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         error_msg = str(e)
         low = error_msg.lower()
-        if "all available options" in low or "resendcode" in low:
+        is_auth_key = (
+            "auth_key" in low
+            or "auth key" in low
+            or "authkey" in low
+            or "authorization key" in low
+        )
+        if is_auth_key:
+            # Idealnya sudah ter-recover otomatis di TelethonAuth.connect();
+            # cabang ini menangkap kasus tepi (mis. error muncul setelah recover
+            # tetap gagal). Bersihkan file session agar /login berikutnya mulai bersih.
+            if user_id in user_auths:
+                cur = user_auths[user_id]
+                try:
+                    cur.cleanup_session()
+                except Exception:
+                    pass
+            friendly = (
+                "♻️ *Auth key tidak dikenali server Telegram*\n\n"
+                "Session lama untuk nomor ini sudah tidak diakui server "
+                "(kemungkinan session dihapus dari *Settings → Devices* atau "
+                "dilupakan server).\n\n"
+                "File session lama sudah dibersihkan. Ketik /login lagi untuk "
+                "memulai dari awal dengan OTP baru."
+            )
+        elif "all available options" in low or "resendcode" in low:
             friendly = (
                 "⚠️ *Semua metode pengiriman OTP sudah dipakai*\n\n"
                 "Telegram membatasi pengiriman kode untuk nomor ini sementara waktu. "
