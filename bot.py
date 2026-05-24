@@ -115,13 +115,18 @@ def main():
         return
     
     try:
-        # Buat Application dengan builder pattern
-        # Jangan aktifkan concurrent_updates bersama ConversationHandler: PTB menyarankan
-        # pemrosesan berurutan agar state percakapan tidak bentrok (gejala: /start, /login ‘mati’).
+        # Buat Application dengan builder pattern.
+        # ``concurrent_updates(True)`` (PTB v20+) memproses update dari
+        # *user/conversation berbeda* secara paralel. Update dari user yang sama
+        # tetap diserialisasi oleh ConversationHandler (default ``block=True``),
+        # jadi state percakapan tetap konsisten. Tanpa ini, operasi panjang
+        # (sweep validitas sessions, scrape multi-session, dll.) memblokir
+        # semua perintah lain dan bot tampak "tidak respon" saat banyak sesi.
         application = (
             Application.builder()
             .token(BOT_TOKEN)
             .post_init(on_post_init)
+            .concurrent_updates(True)
             .build()
         )
 
