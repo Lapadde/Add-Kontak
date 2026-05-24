@@ -21,6 +21,7 @@ warnings.filterwarnings(
 
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, TypeHandler
+from telegram.request import HTTPXRequest
 from config import (
     ADMIN_USER_IDS,
     BOT_TOKEN,
@@ -115,6 +116,36 @@ def main():
         return
     
     try:
+        # ─── HTTPX request: lebih tahan terhadap koneksi server-drop ──────────
+        # `httpx.RemoteProtocolError: Server disconnected without sending a
+        # response` adalah error transient bila pool koneksi terlalu kecil
+        # atau koneksi idle di-drop server Telegram. Setting di bawah ini
+        # memperbesar pool dan timeout supaya bot tetap responsif.
+        #
+        # - connection_pool_size: jumlah koneksi keep-alive ke api.telegram.org.
+        #   Default 1 tidak cukup untuk concurrent_updates(True). 64 cukup
+        #   longgar untuk bot ini.
+        # - pool_timeout: berapa lama menunggu slot koneksi di pool sebelum
+        #   error. Naikkan supaya request paralel tidak gagal duluan.
+        # - connect/read/write_timeout: dilonggarkan agar tidak salah-tafsir
+        #   slow-network sebagai disconnect.
+        request = HTTPXRequest(
+            connection_pool_size=64,
+            pool_timeout=20.0,
+            connect_timeout=20.0,
+            read_timeout=40.0,
+            write_timeout=40.0,
+        )
+        get_updates_request = HTTPXRequest(
+            connection_pool_size=8,
+            pool_timeout=20.0,
+            connect_timeout=20.0,
+            # Long-poll: read_timeout HARUS lebih besar dari polling timeout PTB.
+            # Default PTB long-poll = 10 detik; kita beri buffer.
+            read_timeout=60.0,
+            write_timeout=40.0,
+        )
+
         # Buat Application dengan builder pattern.
         # ``concurrent_updates(True)`` (PTB v20+) memproses update dari
         # *user/conversation berbeda* secara paralel. Update dari user yang sama
@@ -127,6 +158,8 @@ def main():
             .token(BOT_TOKEN)
             .post_init(on_post_init)
             .concurrent_updates(True)
+            .request(request)
+            .get_updates_request(get_updates_request)
             .build()
         )
 
@@ -151,6 +184,42 @@ def main():
             application.add_handler(handler, group=1)
         for handler in get_manage_handlers():
             application.add_handler(handler, group=1)
+
+        # ─── Error handler global: serap NetworkError transient ──────────────
+        # ``httpx.RemoteProtocolError``, ``ReadError``, dan kerabatnya muncul
+        # ketika koneksi ke api.telegram.org di-drop oleh server (idle, NAT,
+        # dll.). PTB polling akan melanjutkan sendiri di siklus berikutnya;
+        # error itu hanya bising di konsol. Kita ringkas jadi satu baris
+        # peringatan agar log tetap berguna untuk error nyata.
+        from telegram.error import NetworkError, TimedOut, RetryAfter, BadRequest
+        import traceback as _traceback
+
+        async def _global_error_handler(update, context):  # type: ignore[no-redef]
+            err = context.error
+            if isinstance(err, (NetworkError, TimedOut)):
+                # Transient — biarkan PTB retry di getUpdates berikutnya.
+                logging.getLogger("ptb").warning(
+                    "Transient network error: %s. Bot akan melanjutkan polling.",
+                    str(err)[:160],
+                )
+                return
+            if isinstance(err, RetryAfter):
+                logging.getLogger("ptb").warning(
+                    "Telegram rate-limit RetryAfter: tunggu %s detik.",
+                    getattr(err, "retry_after", "?"),
+                )
+                return
+            if isinstance(err, BadRequest):
+                logging.getLogger("ptb").warning("BadRequest: %s", err)
+                return
+            # Untuk error lain, tampilkan traceback agar bisa diinvestigasi.
+            logging.getLogger("ptb").error(
+                "Unhandled error in handler: %s\n%s",
+                err,
+                "".join(_traceback.format_exception(type(err), err, err.__traceback__)),
+            )
+
+        application.add_error_handler(_global_error_handler)
         
         # Tambahkan shutdown callback untuk membersihkan SEMUA koneksi aktif
         async def post_shutdown(app):
