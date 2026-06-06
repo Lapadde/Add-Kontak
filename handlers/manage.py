@@ -1062,7 +1062,8 @@ async def _run_manage_scrape_all_sessions_core(
         "Gabung ke grup sumber & tujuan",
         [
             f"Menjalankan **{n_ph}** session **paralel** \\(satu task per nomor\\)\\.\\.\\.",
-            "Termasuk **memuat peer cache** \\(daftar anggota grup sumber\\) agar undangan lintas\\-session bekerja\\.",
+            "Termasuk **memuat peer cache** awal grup sumber \\(5k\\) \\+ resolve otomatis "
+            "via API saat undangan untuk grup besar\\.",
             "Mohon tunggu\\.\\.\\.",
         ],
     )
@@ -1188,8 +1189,8 @@ async def _run_manage_scrape_all_sessions_core(
     session_capped_phones = set()  # session yang sudah mencapai cap
 
     async def _invite_wave_task(phone: str, chunk: list):
-        # chunk: list[User] dari scraper. Kita lookup User-versi-phone-ini di auth_pool[phone]["users"]
-        # supaya access_hash valid untuk client yang akan memanggil InviteToChannelRequest.
+        # chunk: list[User] dari scraper. Resolve ke User dengan access_hash valid
+        # untuk client session ini (cache join → username → get_entity → GetParticipant).
         out = {
             "phone": phone,
             "invited": 0,
@@ -1207,28 +1208,31 @@ async def _run_manage_scrape_all_sessions_core(
             out["note"] = "session tidak aktif di pool"
             return out
         auth = entry["auth"]
+        loc_src = entry["src"]
         loc_tgt = entry["tgt"]
         user_map = entry["users"]
-        users_for_this = []
-        requeue_uncached = []  # scraper-User yang tidak ada di peer cache phone ini
-        scraper_by_id = {}     # uid -> scraper User (untuk balikin ke antrian saat FloodWait)
+        scraper_by_id = {}  # uid -> scraper User (untuk balikin ke antrian saat FloodWait)
+        chunk_for_resolve = []
+        requeue_no_uid = []
         for u in chunk:
             uid = getattr(u, "id", None)
             if uid is None:
-                requeue_uncached.append(u)
+                requeue_no_uid.append(u)
                 continue
             scraper_by_id[uid] = u
-            mapped = user_map.get(uid)
-            if mapped is not None:
-                users_for_this.append(mapped)
-            else:
-                requeue_uncached.append(u)
+            chunk_for_resolve.append(u)
+
+        failed_s = []
+        users_for_this, requeue_unresolved, failed_s = await auth.resolve_users_for_invite_session(
+            chunk_for_resolve, loc_src, user_map, failed_s
+        )
         if not users_for_this:
-            out["return_chunk"] = list(chunk)
-            out["note"] = "tidak ada user terkait di peer cache session ini"
+            out["return_chunk"] = list(requeue_no_uid) + list(requeue_unresolved)
+            out["failed_sample"] = failed_s
+            if requeue_unresolved:
+                out["note"] = "gagal resolve; dikembalikan ke antrian"
             return out
         try:
-            failed_s = []
             sub = await auth.invite_user_chunk_to_target(
                 loc_tgt, users_for_this, failed_s, skip_hydrate=True
             )
@@ -1245,7 +1249,9 @@ async def _run_manage_scrape_all_sessions_core(
                 back = scraper_by_id.get(uid) if uid is not None else None
                 if back is not None:
                     rem_scraper.append(back)
-            out["return_chunk"] = list(requeue_uncached) + rem_scraper
+            out["return_chunk"] = (
+                list(requeue_no_uid) + list(requeue_unresolved) + rem_scraper
+            )
             return out
         except Exception as ex:
             out["return_chunk"] = list(chunk)
@@ -1368,7 +1374,7 @@ async def _run_manage_scrape_all_sessions_core(
                 continue
             q.appendleft(u)
 
-        # Deteksi loop tanpa kemajuan: antrian tidak bergerak (peer cache miss penuh, dll.).
+        # Deteksi loop tanpa kemajuan: antrian tidak bergerak (resolve/undangan gagal total, dll.).
         wave_dropped = dropped_due_to_fails - dropped_before_wave
         progressed_this_wave = (
             wave_invited > 0

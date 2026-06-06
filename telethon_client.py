@@ -1259,6 +1259,115 @@ class TelethonAuth:
             out.append(u)
         return out, mode, note
 
+    async def _resolve_single_user_for_invite(
+        self,
+        user: User,
+        source_entity,
+    ):
+        """Ambil ``User`` dengan access_hash valid untuk client ini.
+
+        Urutan: username → user_id → ``GetParticipantRequest`` di grup sumber
+        (penting untuk grup besar di mana peer cache join tidak lengkap).
+        """
+        if not self.is_connected or not isinstance(user, User):
+            return None
+        uid = getattr(user, "id", None)
+        if uid is None or getattr(user, "bot", False):
+            return None
+        try:
+            me = await self.client.get_me()
+            if me and uid == me.id:
+                return None
+        except Exception:
+            pass
+
+        uname = (getattr(user, "username", None) or "").strip()
+        if uname:
+            try:
+                ent = await self.client.get_entity(uname)
+                if isinstance(ent, User) and ent.id == uid:
+                    return ent
+            except Exception:
+                pass
+
+        try:
+            ent = await self.client.get_entity(uid)
+            if isinstance(ent, User) and ent.id == uid:
+                return ent
+        except Exception:
+            pass
+
+        if source_entity is not None and isinstance(source_entity, Channel):
+            try:
+                part = await self.client(
+                    GetParticipantRequest(channel=source_entity, participant=uid)
+                )
+                for u in getattr(part, "users", None) or []:
+                    if isinstance(u, User) and u.id == uid:
+                        return u
+                part_user = getattr(part, "user", None)
+                if isinstance(part_user, User) and part_user.id == uid:
+                    return part_user
+                # GetParticipant sukses: coba get_entity lagi (peer sudah di-cache).
+                try:
+                    ent = await self.client.get_entity(uid)
+                    if isinstance(ent, User) and ent.id == uid:
+                        return ent
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return None
+
+    async def resolve_users_for_invite_session(
+        self,
+        scraper_users: list,
+        source_entity,
+        user_map: dict,
+        failed_sample: list = None,
+        max_failed: int = 14,
+    ) -> tuple:
+        """Map user dari session scraper ke ``User`` valid untuk client ini.
+
+        Returns:
+            (resolved_users, requeue_scraper_users, failed_sample)
+        """
+        if failed_sample is None:
+            failed_sample = []
+        if not self.is_connected or not scraper_users:
+            return [], list(scraper_users or []), failed_sample
+
+        resolved = []
+        requeue = []
+        seen_ids = set()
+
+        for u in scraper_users:
+            if not isinstance(u, User):
+                continue
+            uid = getattr(u, "id", None)
+            if uid is None:
+                requeue.append(u)
+                continue
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+
+            cached = user_map.get(uid)
+            if cached is not None:
+                resolved.append(cached)
+                continue
+
+            fresh = await self._resolve_single_user_for_invite(u, source_entity)
+            if fresh is not None:
+                user_map[uid] = fresh
+                resolved.append(fresh)
+            else:
+                requeue.append(u)
+            await asyncio.sleep(0.12)
+
+        return resolved, requeue, failed_sample
+
     async def _hydrate_users_for_invite(self, users: list, failed_sample: list, max_failed: int = 14):
         """Entity User dari session lain punya access_hash milik client lain; ambil ulang via client ini."""
         if not self.is_connected or not users:
@@ -1275,13 +1384,11 @@ class TelethonAuth:
             uid = getattr(u, "id", None)
             if uid is None or uid == me_id or getattr(u, "bot", False):
                 continue
-            try:
-                fresh = await self.client.get_entity(uid)
-                if isinstance(fresh, User) and not getattr(fresh, "bot", False) and fresh.id != me_id:
-                    out.append(fresh)
-            except Exception as e:
-                if len(failed_sample) < max_failed:
-                    failed_sample.append((uid, (str(e) or "gagal resolve user")[:120]))
+            fresh = await self._resolve_single_user_for_invite(u, source_entity=None)
+            if fresh is not None:
+                out.append(fresh)
+            elif len(failed_sample) < max_failed:
+                failed_sample.append((uid, "gagal resolve user"[:120]))
         return out
 
     async def invite_user_chunk_to_target(
