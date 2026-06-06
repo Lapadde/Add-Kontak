@@ -1168,6 +1168,8 @@ async def _run_manage_scrape_all_sessions_core(
     # 4) Undangan paralel antar session. Tiap session resolve tujuan SENDIRI.
     q = deque(users_list)
     total_invited = 0
+    total_already_participant = 0
+    invited_uids_global: set[int] = set()
     rpc_fail_lines = []
     flooded_skip_notes = []
     round_notes = []
@@ -1180,13 +1182,8 @@ async def _run_manage_scrape_all_sessions_core(
     no_progress_streak = 0
     NO_PROGRESS_BREAK = 5
     last_wave_note = None
-    # Dua counter terpisah:
-    # - `session_attempted_count`: hard-cap budget (cara hitung: jumlah user yang
-    #   benar-benar dikirim ke Telegram, dihitung saat chunk dirakit & di-refund
-    #   bila chunk dikembalikan oleh wave). Ini yang dipakai untuk **enforce cap**.
-    # - `session_invited_count`: jumlah undangan **sukses** menurut laporan Telegram
-    #   (UpdateChannelParticipant), dipakai hanya untuk tampilan ringkasan.
-    session_attempted_count = {p: 0 for p in phones_ok}
+    # `session_invited_count`: undangan **baru terverifikasi** per session (dedup
+    # global per user_id). Dipakai untuk ringkasan dan **enforce cap** per session.
     session_invited_count = {p: 0 for p in phones_ok}
     session_capped_phones = set()  # session yang sudah mencapai cap
 
@@ -1196,6 +1193,8 @@ async def _run_manage_scrape_all_sessions_core(
         out = {
             "phone": phone,
             "invited": 0,
+            "already_participant": 0,
+            "invited_user_ids": [],
             "flood_wait_seconds": None,
             "peer_flood": False,
             "return_chunk": [],
@@ -1234,6 +1233,8 @@ async def _run_manage_scrape_all_sessions_core(
                 loc_tgt, users_for_this, failed_s, skip_hydrate=True
             )
             out["invited"] = int(sub.get("invited") or 0)
+            out["already_participant"] = int(sub.get("already_participant") or 0)
+            out["invited_user_ids"] = list(sub.get("invited_user_ids") or [])
             out["flood_wait_seconds"] = sub.get("flood_wait_seconds")
             out["peer_flood"] = bool(sub.get("peer_flood"))
             out["failed_sample"] = list(sub.get("failed_sample") or [])
@@ -1257,11 +1258,10 @@ async def _run_manage_scrape_all_sessions_core(
             break
         assignments = []
         for phone in active_list:
-            # Hitung sisa kuota per session jika cap aktif. Pakai counter "attempted"
-            # supaya cap menjadi HARD limit, terlepas dari apakah Telegram melaporkan
-            # sukses lewat update (kadang under-reported).
+            # Cap per session: hanya undangan **baru terverifikasi** yang dihitung.
+            # Already participant / gagal RPC / peer-cache miss tidak memakai kuota.
             if per_session_cap > 0:
-                remaining_cap = per_session_cap - session_attempted_count.get(phone, 0)
+                remaining_cap = per_session_cap - session_invited_count.get(phone, 0)
                 if remaining_cap <= 0:
                     phones_active.discard(phone)
                     session_capped_phones.add(phone)
@@ -1275,12 +1275,6 @@ async def _run_manage_scrape_all_sessions_core(
                     chunk.append(q.popleft())
             if chunk:
                 assignments.append((phone, chunk))
-                # Reserve budget upfront. Bagian yang dikembalikan oleh wave (mis.
-                # tidak ada di peer cache / FloodWait stop) akan di-refund di bawah.
-                if per_session_cap > 0:
-                    session_attempted_count[phone] = (
-                        session_attempted_count.get(phone, 0) + len(chunk)
-                    )
         if not assignments:
             break
 
@@ -1291,8 +1285,11 @@ async def _run_manage_scrape_all_sessions_core(
         )
 
         wave_invited = 0
+        wave_already = 0
+        wave_failed = 0
         wave_flood = []
         wave_returned_users = []  # users yang dikembalikan ke antrian (untuk hitung kegagalan)
+        dropped_before_wave = dropped_due_to_fails
         for i, r in enumerate(results):
             phone, chunk = assignments[i]
             if isinstance(r, Exception):
@@ -1303,32 +1300,33 @@ async def _run_manage_scrape_all_sessions_core(
             ret_chunk = r.get("return_chunk") or []
             if ret_chunk:
                 wave_returned_users.extend(ret_chunk)
-            # Refund budget per chunk yang dikembalikan (tidak benar-benar
-            # dikirim ke Telegram), agar cap hanya menahan user yang TRULY sent.
             rphone = r.get("phone") or phone
-            if per_session_cap > 0 and ret_chunk:
-                session_attempted_count[rphone] = max(
-                    0,
-                    session_attempted_count.get(rphone, 0) - len(ret_chunk),
-                )
             if r.get("note"):
                 round_notes.append(
                     f"`{escape_markdown(str(r['phone']), version=1)}`: "
                     f"{escape_markdown(str(r['note']), version=1)}"
                 )
                 last_wave_note = f"{r['phone']}: {r['note']}"
-            inv = int(r.get("invited") or 0)
-            wave_invited += inv
-            total_invited += inv
-            if inv > 0 and rphone:
+            already_n = int(r.get("already_participant") or 0)
+            total_already_participant += already_n
+            wave_already += already_n
+            wave_failed += len(r.get("failed_sample") or [])
+            # Dedup global: satu user_id hanya +1 ke total meski diundang ulang.
+            new_unique = 0
+            for uid in r.get("invited_user_ids") or []:
+                if uid not in invited_uids_global:
+                    invited_uids_global.add(uid)
+                    new_unique += 1
+            wave_invited += new_unique
+            total_invited += new_unique
+            if new_unique > 0 and rphone:
                 session_invited_count[rphone] = (
-                    session_invited_count.get(rphone, 0) + inv
+                    session_invited_count.get(rphone, 0) + new_unique
                 )
-            # Cek cap berdasar budget (HARD limit), bukan reported invited.
             if (
                 per_session_cap > 0
                 and rphone
-                and session_attempted_count.get(rphone, 0) >= per_session_cap
+                and session_invited_count.get(rphone, 0) >= per_session_cap
             ):
                 phones_active.discard(rphone)
                 session_capped_phones.add(rphone)
@@ -1370,12 +1368,14 @@ async def _run_manage_scrape_all_sessions_core(
                 continue
             q.appendleft(u)
 
-        # Deteksi loop tanpa kemajuan: jika tidak ada undangan & tidak ada drop & tidak ada flood baru
-        # untuk beberapa gelombang berturut-turut → keluar agar tidak menghabiskan waktu sia-sia.
+        # Deteksi loop tanpa kemajuan: antrian tidak bergerak (peer cache miss penuh, dll.).
+        wave_dropped = dropped_due_to_fails - dropped_before_wave
         progressed_this_wave = (
             wave_invited > 0
+            or wave_already > 0
+            or wave_failed > 0
             or bool(wave_flood)
-            or dropped_due_to_fails > 0
+            or wave_dropped > 0
         )
         if progressed_this_wave:
             no_progress_streak = 0
@@ -1411,8 +1411,8 @@ async def _run_manage_scrape_all_sessions_core(
             ]
             if per_session_cap > 0:
                 prog.append(
-                    f"🎯 Batas per session: **{per_session_cap}** anggota "
-                    f"\\(sudah penuh: **{len(session_capped_phones)}**\\)"
+                    f"🎯 Batas per session: **{per_session_cap}** terundang terverifikasi "
+                    f"\\(session cap penuh: **{len(session_capped_phones)}**\\)"
                 )
             if dropped_due_to_fails:
                 prog.append(
@@ -1450,8 +1450,8 @@ async def _run_manage_scrape_all_sessions_core(
         return s if len(s) <= n else (s[: max(0, n - 1)] + "…")
 
     cap_line = (
-        f"🎯 Batas per session: **{per_session_cap}** "
-        f"\\(penuh: **{len(session_capped_phones)}**\\)"
+        f"🎯 Batas per session: **{per_session_cap}** terundang terverifikasi "
+        f"\\(session cap penuh: **{len(session_capped_phones)}**\\)"
         if per_session_cap > 0
         else "🎯 Batas per session: **tanpa batas**"
     )
@@ -1463,12 +1463,18 @@ async def _run_manage_scrape_all_sessions_core(
         f"🔎 Filter: **{fl_human}**",
         f"📇 Kandidat scrape: **{len(users_list)}**",
         f"✅ **Terundang total**: **{total_invited}**",
+    ]
+    if total_already_participant > 0:
+        header.append(
+            f"ℹ️ Sudah member sebelumnya \\(tidak dihitung\\): **{total_already_participant}**"
+        )
+    header.extend([
         f"📦 Sisa antrian: **{len(q)}**",
         f"🗑️ Di\\-drop \\(gagal {DROP_USER_AFTER_FAILS}×\\): **{dropped_due_to_fails}**",
         cap_line,
         f"👥 Session aktif: **{len(phones_active)}** / **{len(phones_ok)}** "
         f"\\(dari **{len(phones)}** dipilih\\)",
-    ]
+    ])
     if not phones_active and q:
         if per_session_cap > 0 and len(session_capped_phones) >= len(phones_ok):
             header.append(
