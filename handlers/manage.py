@@ -654,6 +654,48 @@ def _clear_manage_scrape_all_data(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop(k, None)
 
 
+MSCRAPE_LEAVE_SOURCE_KEY = "mscrape_leave_source_link"
+MSCRAPE_LEAVE_PHONES_KEY = "mscrape_leave_phones"
+
+
+def _scrape_all_done_keyboard(show_leave: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if show_leave:
+        rows.append([
+            InlineKeyboardButton(
+                "🚪 Keluar grup sumber (semua session)",
+                callback_data="mscrape_leave_source",
+            )
+        ])
+    rows.append([InlineKeyboardButton("🔙 Menu manage", callback_data="back_to_menu")])
+    rows.append([InlineKeyboardButton("🗑️ Hapus", callback_data="delete_message")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _store_scrape_all_leave_context(
+    context: ContextTypes.DEFAULT_TYPE | None,
+    source_link: str,
+    phones: list,
+) -> None:
+    if context is None:
+        return
+    ud = context.user_data
+    if ud is None:
+        return
+    ud[MSCRAPE_LEAVE_SOURCE_KEY] = source_link
+    ud[MSCRAPE_LEAVE_PHONES_KEY] = list(phones)
+
+
+def _clear_scrape_all_leave_context(context: ContextTypes.DEFAULT_TYPE | None) -> None:
+    if context is None:
+        return
+    ud = context.user_data
+    if ud is None:
+        return
+    ud.pop(MSCRAPE_LEAVE_SOURCE_KEY, None)
+    ud.pop(MSCRAPE_LEAVE_PHONES_KEY, None)
+
+
 def _parse_manage_scrape_session_range(text: str, all_phones: list) -> tuple:
     """Pilih subset session dari nomor urut 1..N (urutan sama seperti folder terurut).
     Kembalikan (subset_list|None, error_message|None)."""
@@ -892,7 +934,13 @@ async def manage_scrape_all_pick_filter(update: Update, context: ContextTypes.DE
         parse_mode="Markdown",
     )
     await _run_manage_scrape_all_sessions_core(
-        query, src, tgt, days, phones_sel, per_session_cap=per_session_cap
+        query,
+        src,
+        tgt,
+        days,
+        phones_sel,
+        per_session_cap=per_session_cap,
+        context=context,
     )
     return ConversationHandler.END
 
@@ -904,6 +952,7 @@ async def _run_manage_scrape_all_sessions_core(
     last_seen_days: int,
     phones=None,
     per_session_cap: int = 0,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ):
     """Orkestrasi: gabung PARALEL → scrape → undangan PARALEL antar session.
 
@@ -1158,13 +1207,88 @@ async def _run_manage_scrape_all_sessions_core(
         )
         return
 
+    scrape_candidates_count = len(users_list)
     progress_after_scrape = [
-        f"Selesai: **{len(users_list)}** anggota lolos filter \\(calon undangan\\)\\.",
+        f"Selesai: **{scrape_candidates_count}** anggota lolos filter \\(calon undangan\\)\\.",
     ]
     if hidden_members_note:
         progress_after_scrape.append(hidden_members_note)
-    progress_after_scrape.append("Lanjut: undangan **paralel** antar session\\.\\.\\.")
+    progress_after_scrape.append(
+        "Lanjut: filter yang **sudah join** grup tujuan\\.\\.\\."
+    )
     await _progress_edit("Scrape anggota grup sumber", progress_after_scrape)
+
+    # 3b) Pra-filter: buang kandidat yang sudah anggota grup tujuan (session scraper).
+    skipped_already_in_target = 0
+    target_filter_note = None
+    await _progress_edit(
+        "Filter anggota grup tujuan",
+        [
+            f"Session scraper: `{escape_markdown(scraper, version=1)}`",
+            "Membaca member grup **tujuan** \\(hanya daftar resmi, bukan fallback pesan\\)\\.\\.\\.",
+            f"Kandidat dari sumber: **{scrape_candidates_count}**",
+        ],
+    )
+    try:
+        users_list, skipped_already_in_target, target_filter_note = await entry_s[
+            "auth"
+        ].filter_users_already_in_target_group(users_list, entry_s["tgt"])
+    except Exception as ex_tf:
+        target_filter_note = f"Filter tujuan gagal: {str(ex_tf)[:100]}"
+
+    filter_progress = []
+    if skipped_already_in_target > 0:
+        filter_progress.append(
+            f"⏭️ **{skipped_already_in_target}** sudah di grup tujuan — "
+            f"dikeluarkan dari antrian undangan\\."
+        )
+        filter_progress.append(
+            f"📋 Sisa calon undangan: **{len(users_list)}**"
+        )
+    elif target_filter_note:
+        filter_progress.append(
+            f"ℹ️ {escape_markdown(str(target_filter_note)[:160], version=1)}"
+        )
+        filter_progress.append(
+            f"📋 Antrian undangan tetap: **{len(users_list)}**"
+        )
+    else:
+        filter_progress.append(
+            f"✅ Tidak ada kandidat yang sudah di grup tujuan\\. "
+            f"Antrian: **{len(users_list)}**"
+        )
+    filter_progress.append("Lanjut: undangan **paralel** antar session\\.\\.\\.")
+    await _progress_edit("Filter anggota grup tujuan", filter_progress)
+
+    if not users_list:
+        fl = escape_markdown(
+            _manage_scrape_all_filter_labels().get(last_seen_days, ""), version=1
+        )
+        await _disconnect_pool()
+        lines = [
+            f"⚠️ **Tidak ada calon undangan** setelah filter grup tujuan\\.",
+            "",
+            f"📤 Sumber: `{escape_markdown(str(src_lbl), version=1)}`",
+            f"📥 Tujuan: `{escape_markdown(str(tgt_lbl), version=1)}`",
+            f"🔎 Filter sumber: **{fl}**",
+            f"📇 Kandidat scrape: **{scrape_candidates_count}**",
+        ]
+        if skipped_already_in_target > 0:
+            lines.append(
+                f"⏭️ Sudah di grup tujuan: **{skipped_already_in_target}** "
+                f"\\(semua kandidat\\)"
+            )
+        elif target_filter_note:
+            lines.append(
+                f"ℹ️ {escape_markdown(str(target_filter_note)[:140], version=1)}"
+            )
+        await _safe_edit(
+            "\n".join(lines),
+            reply_markup=_scrape_all_done_keyboard(show_leave=True),
+            parse_mode="Markdown",
+        )
+        _store_scrape_all_leave_context(context, source_link, phones)
+        return
 
     # 4) Undangan paralel antar session. Tiap session resolve tujuan SENDIRI.
     q = deque(users_list)
@@ -1467,12 +1591,20 @@ async def _run_manage_scrape_all_sessions_core(
         f"📤 Sumber: `{_short(sl, 60)}`",
         f"📥 Tujuan: `{_short(tl, 60)}`",
         f"🔎 Filter: **{fl_human}**",
-        f"📇 Kandidat scrape: **{len(users_list)}**",
+        f"📇 Kandidat scrape: **{scrape_candidates_count}**",
         f"✅ **Terundang total**: **{total_invited}**",
     ]
+    if skipped_already_in_target > 0:
+        header.append(
+            f"⏭️ Sudah di grup tujuan \\(filter scrape\\): **{skipped_already_in_target}**"
+        )
+    elif target_filter_note:
+        header.append(
+            f"ℹ️ Filter tujuan: {escape_markdown(str(target_filter_note)[:120], version=1)}"
+        )
     if total_already_participant > 0:
         header.append(
-            f"ℹ️ Sudah member sebelumnya \\(tidak dihitung\\): **{total_already_participant}**"
+            f"ℹ️ Sudah member saat undangan \\(tidak dihitung\\): **{total_already_participant}**"
         )
     header.extend([
         f"📦 Sisa antrian: **{len(q)}**",
@@ -1533,8 +1665,98 @@ async def _run_manage_scrape_all_sessions_core(
     if truncated:
         text = text + "\n\n_… ringkasan dipotong agar muat di Telegram\\._"
 
+    _store_scrape_all_leave_context(context, source_link, phones)
     await _disconnect_pool()
-    await _safe_edit(text, reply_markup=back_kb, parse_mode="Markdown")
+    await _safe_edit(
+        text,
+        reply_markup=_scrape_all_done_keyboard(show_leave=True),
+        parse_mode="Markdown",
+    )
+
+
+async def manage_scrape_all_leave_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Keluarkan semua session terpilih dari grup sumber (setelah scrape semua selesai)."""
+    query = update.callback_query
+    if not is_admin(update.effective_user.id):
+        await query.answer("❌ Akses ditolak.", show_alert=True)
+        return
+    await query.answer()
+
+    source_link = (context.user_data or {}).get(MSCRAPE_LEAVE_SOURCE_KEY)
+    phones = (context.user_data or {}).get(MSCRAPE_LEAVE_PHONES_KEY)
+    if not source_link or not phones:
+        await query.answer(
+            "Data keluar grup sudah tidak ada. Ulangi scrape jika perlu.",
+            show_alert=True,
+        )
+        return
+
+    n_ph = len(phones)
+    await query.edit_message_text(
+        f"⏳ Mengeluarkan **{n_ph}** session dari grup sumber\\.\\.\\.",
+        parse_mode="Markdown",
+    )
+
+    async def _leave_one(phone: str):
+        auth = TelethonAuth(phone)
+        try:
+            if not auth.is_session_exists():
+                return phone, False, "tidak ada file session"
+            if not await auth.connect():
+                return phone, False, "belum login"
+            ent, err = await auth.resolve_group_entity_for_invite(source_link)
+            if err:
+                return phone, False, (err or "resolve gagal")[:80]
+            ok, err2 = await auth.leave_group_entity(ent)
+            if ok:
+                return phone, True, None
+            return phone, False, (err2 or "gagal keluar")[:80]
+        except Exception as ex:
+            return phone, False, str(ex)[:80]
+        finally:
+            try:
+                await auth.disconnect()
+            except Exception:
+                pass
+
+    gather_res = await asyncio.gather(
+        *[_leave_one(p) for p in phones],
+        return_exceptions=True,
+    )
+    ok_n = 0
+    fail_lines = []
+    for item in gather_res:
+        if isinstance(item, Exception):
+            fail_lines.append(f"—: {escape_markdown(str(item)[:60], version=1)}")
+            continue
+        phone, ok, msg = item
+        if ok:
+            ok_n += 1
+        else:
+            pe = escape_markdown(str(phone), version=1)
+            me = escape_markdown(str(msg or "gagal")[:72], version=1)
+            fail_lines.append(f"`{pe}`: {me}")
+
+    _clear_scrape_all_leave_context(context)
+
+    lines = [
+        "🚪 **Keluar grup sumber selesai**",
+        "",
+        f"✅ Berhasil: **{ok_n}** / **{n_ph}** session",
+    ]
+    if fail_lines:
+        lines.append("")
+        lines.append("**Gagal:**")
+        for ln in fail_lines[:12]:
+            lines.append(ln)
+        if len(fail_lines) > 12:
+            lines.append(f"… \\+{len(fail_lines) - 12} lainnya")
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=_scrape_all_done_keyboard(show_leave=False),
+        parse_mode="Markdown",
+    )
 
 
 async def manage_scrape_all_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2956,6 +3178,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_string_session(update, context)
     elif query.data == "delete_message":
         await delete_message(update, context)
+    elif query.data == "mscrape_leave_source":
+        await manage_scrape_all_leave_source(update, context)
     # Jika callback tidak dikenali, jangan lakukan apa-apa
     # Biarkan handler lain yang menanganinya
 

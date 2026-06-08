@@ -20,6 +20,7 @@ from telethon.errors import (
 )
 from telethon.tl.functions.channels import (
     JoinChannelRequest,
+    LeaveChannelRequest,
     InviteToChannelRequest,
     GetParticipantRequest,
 )
@@ -29,6 +30,7 @@ from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
     CheckChatInviteRequest,
     AddChatUserRequest,
+    DeleteChatUserRequest,
 )
 from telethon.tl.types import (
     User,
@@ -1031,6 +1033,42 @@ class TelethonAuth:
 
         return True, None
 
+    async def leave_group_entity(self, entity):
+        """Keluar dari grup/supergroup/channel. Return (ok, error_message|None)."""
+        if not self.is_connected:
+            return False, "belum terkoneksi"
+        try:
+            if isinstance(entity, Channel):
+                await self.client(LeaveChannelRequest(entity))
+                return True, None
+            if isinstance(entity, Chat):
+                me = await self.client.get_me()
+                if not me:
+                    return False, "gagal get_me"
+                await self.client(
+                    DeleteChatUserRequest(
+                        chat_id=entity.id,
+                        user_id=InputUser(
+                            user_id=me.id, access_hash=me.access_hash or 0
+                        ),
+                    )
+                )
+                return True, None
+            return False, "tipe grup tidak didukung"
+        except UserNotParticipantError:
+            return True, None
+        except FloodWaitError as e:
+            return False, f"FloodWait {int(e.seconds)}s"
+        except Exception as e:
+            el = str(e).lower()
+            if (
+                "not a member" in el
+                or "not participant" in el
+                or "user_not_participant" in el
+            ):
+                return True, None
+            return False, str(e)[:120]
+
     async def join_group_with_link(self, group_link: str):
         """Gabung ke grup/supergroup dari link undangan atau @username / URL publik."""
         if not self.is_connected:
@@ -1226,6 +1264,67 @@ class TelethonAuth:
                 if before > 0:
                     mode = "mixed"
         return users_by_id, mode, note
+
+    async def collect_group_member_ids(
+        self,
+        group_entity,
+        participants_limit: int = 0,
+    ):
+        """Kumpulkan ``set`` user_id anggota grup (hanya ``iter_participants``).
+
+        Dipakai untuk pra-filter: buang kandidat scrape yang sudah join grup tujuan.
+        Tidak memakai fallback pesan — hanya daftar member resmi grup.
+
+        Returns:
+            (member_ids: set[int], mode: str, note: str|None)
+            mode = ``participants`` | ``unavailable``
+        """
+        member_ids: set[int] = set()
+        mode = "participants"
+        note = None
+        if not self.is_connected:
+            return member_ids, "unavailable", "client tidak terkoneksi"
+        try:
+            kwargs = {}
+            if participants_limit and participants_limit > 0:
+                kwargs["limit"] = participants_limit
+            async for p in self.client.iter_participants(group_entity, **kwargs):
+                if isinstance(p, User) and not getattr(p, "bot", False):
+                    member_ids.add(p.id)
+        except ChatAdminRequiredError:
+            mode = "unavailable"
+            note = "member grup tujuan tersembunyi; filter sudah-join tidak lengkap"
+        except FloodWaitError as fw:
+            mode = "unavailable"
+            note = f"FloodWait iter_participants tujuan {int(fw.seconds)}s"
+        except Exception as e:
+            mode = "unavailable"
+            note = f"iter_participants tujuan: {str(e)[:80]}"
+        return member_ids, mode, note
+
+    async def filter_users_already_in_target_group(
+        self, users_list: list, target_entity
+    ):
+        """Buang user dari ``users_list`` yang sudah anggota ``target_entity``.
+
+        Returns:
+            (filtered_list, skipped_count, filter_note)
+        """
+        if not users_list:
+            return [], 0, None
+        member_ids, mode, note = await self.collect_group_member_ids(target_entity)
+        if mode != "participants" or not member_ids:
+            skip_msg = note or "Filter sudah-join dilewati (member tujuan tidak terbaca)."
+            return list(users_list), 0, skip_msg
+        filtered = []
+        skipped = 0
+        for u in users_list:
+            uid = getattr(u, "id", None)
+            if uid is not None and uid in member_ids:
+                skipped += 1
+                continue
+            filtered.append(u)
+        return filtered, skipped, note
 
     async def collect_scraped_users_filtered(self, source_entity, last_seen_days: int):
         """Daftar User di grup sumber yang lolos filter last seen.
