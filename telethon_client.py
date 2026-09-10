@@ -105,6 +105,40 @@ def _is_updates_parsing_bug(exc: BaseException) -> bool:
         return False
     msg = str(exc).lower()
     return "updates" in msg and "not iterable" in msg
+
+
+def _safe_telegram_chats(updates_obj) -> list:
+    """Ambil daftar chat dari objek Updates Telethon; toleransi respons aneh."""
+    if updates_obj is None:
+        return []
+    raw = getattr(updates_obj, "chats", None)
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    try:
+        return list(raw)
+    except TypeError:
+        return []
+
+
+def _safe_telegram_update_items(updates_obj) -> list:
+    """Ambil entri ``.updates``; kadang nilainya objek Updates (tidak iterable)."""
+    if updates_obj is None:
+        return []
+    raw = getattr(updates_obj, "updates", None)
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    try:
+        iter(raw)
+    except TypeError:
+        return []
+    try:
+        return list(raw)
+    except TypeError:
+        return []
 # Jika grup sumber menyembunyikan member, fallback baca riwayat pesan & ambil pengirim unik.
 # Default tetap (tidak dapat diubah dari UI admin).
 HIDDEN_MEMBERS_MSG_FALLBACK_LIMIT = 1000
@@ -122,11 +156,11 @@ def _count_invited_users_from_invite_updates(result, batch_users: list) -> int:
     batch_ids = {u.id for u in batch_users if isinstance(u, User)}
     if not batch_ids:
         return 0
-    updates = getattr(result, "updates", None) if result is not None else None
-    if not updates:
+    update_items = _safe_telegram_update_items(result)
+    if not update_items:
         return 0
     matched = set()
-    for up in updates:
+    for up in update_items:
         if isinstance(up, UpdateChannelParticipant):
             uid = getattr(up, "user_id", None)
             if uid is not None and uid in batch_ids:
@@ -877,20 +911,25 @@ class TelethonAuth:
         """Ambil Channel/Chat dari objek Updates Telethon (beberapa respons kosong di .chats)."""
         if updates is None:
             return None
-        chats = getattr(updates, "chats", None) or []
-        for ch in chats:
-            if isinstance(ch, (Channel, Chat)):
-                return ch
-        channel_ids = []
-        for upd in getattr(updates, "updates", None) or []:
-            cid = getattr(upd, "channel_id", None)
-            if cid is not None:
-                channel_ids.append(cid)
-        for cid in channel_ids:
+        try:
+            chats = _safe_telegram_chats(updates)
             for ch in chats:
-                if isinstance(ch, Channel) and ch.id == cid:
+                if isinstance(ch, (Channel, Chat)):
                     return ch
-        return None
+            channel_ids = []
+            for upd in _safe_telegram_update_items(updates):
+                cid = getattr(upd, "channel_id", None)
+                if cid is not None:
+                    channel_ids.append(cid)
+            for cid in channel_ids:
+                for ch in chats:
+                    if isinstance(ch, Channel) and ch.id == cid:
+                        return ch
+            return None
+        except TypeError as te:
+            if _is_updates_parsing_bug(te):
+                return None
+            raise
 
     async def _entity_from_invite_hash_check(self, inv_hash: str):
         """Cek undangan; jika userbot sudah anggota, kembalikan entity chat."""
@@ -903,22 +942,27 @@ class TelethonAuth:
 
     async def _entity_from_updates_with_fallback(self, updates):
         """Parse Updates + fallback ``get_entity(PeerChannel)`` bila .chats kosong."""
-        ent = self._extract_entity_from_telegram_updates(updates)
-        if ent is not None:
-            return ent
-        seen = set()
-        for upd in getattr(updates, "updates", None) or []:
-            cid = getattr(upd, "channel_id", None)
-            if cid is None or cid in seen:
-                continue
-            seen.add(cid)
-            try:
-                fresh = await self.client.get_entity(PeerChannel(cid))
-                if isinstance(fresh, (Channel, Chat)):
-                    return fresh
-            except Exception:
-                continue
-        return None
+        try:
+            ent = self._extract_entity_from_telegram_updates(updates)
+            if ent is not None:
+                return ent
+            seen = set()
+            for upd in _safe_telegram_update_items(updates):
+                cid = getattr(upd, "channel_id", None)
+                if cid is None or cid in seen:
+                    continue
+                seen.add(cid)
+                try:
+                    fresh = await self.client.get_entity(PeerChannel(cid))
+                    if isinstance(fresh, (Channel, Chat)):
+                        return fresh
+                except Exception:
+                    continue
+            return None
+        except TypeError as te:
+            if _is_updates_parsing_bug(te):
+                return None
+            raise
 
     async def _resolve_invite_hash(self, inv_hash: str):
         """Resolve grup dari hash undangan ``t.me/+HASH``."""
