@@ -873,6 +873,103 @@ class TelethonAuth:
             else:
                 return False, f"Error tidak terduga: {str(e)}"
 
+    def _extract_entity_from_telegram_updates(self, updates):
+        """Ambil Channel/Chat dari objek Updates Telethon (beberapa respons kosong di .chats)."""
+        if updates is None:
+            return None
+        chats = getattr(updates, "chats", None) or []
+        for ch in chats:
+            if isinstance(ch, (Channel, Chat)):
+                return ch
+        channel_ids = []
+        for upd in getattr(updates, "updates", None) or []:
+            cid = getattr(upd, "channel_id", None)
+            if cid is not None:
+                channel_ids.append(cid)
+        for cid in channel_ids:
+            for ch in chats:
+                if isinstance(ch, Channel) and ch.id == cid:
+                    return ch
+        return None
+
+    async def _entity_from_invite_hash_check(self, inv_hash: str):
+        """Cek undangan; jika userbot sudah anggota, kembalikan entity chat."""
+        checked = await self.client(CheckChatInviteRequest(inv_hash))
+        if isinstance(checked, ChatInviteAlready):
+            ch = getattr(checked, "chat", None)
+            if ch is not None:
+                return ch, None
+        return None, None
+
+    async def _entity_from_updates_with_fallback(self, updates):
+        """Parse Updates + fallback ``get_entity(PeerChannel)`` bila .chats kosong."""
+        ent = self._extract_entity_from_telegram_updates(updates)
+        if ent is not None:
+            return ent
+        seen = set()
+        for upd in getattr(updates, "updates", None) or []:
+            cid = getattr(upd, "channel_id", None)
+            if cid is None or cid in seen:
+                continue
+            seen.add(cid)
+            try:
+                fresh = await self.client.get_entity(PeerChannel(cid))
+                if isinstance(fresh, (Channel, Chat)):
+                    return fresh
+            except Exception:
+                continue
+        return None
+
+    async def _resolve_invite_hash(self, inv_hash: str):
+        """Resolve grup dari hash undangan ``t.me/+HASH``."""
+        try:
+            ent, err = await self._entity_from_invite_hash_check(inv_hash)
+            if ent is not None:
+                return ent, None
+        except Exception as e:
+            el = str(e).lower()
+            if "timeout" in el or "timed out" in el or "connect" in el:
+                return None, "Timeout koneksi Telegram saat cek undangan (jaringan VPS?)"
+            return None, f"Gagal cek undangan: {str(e)[:120]}"
+
+        updates = None
+        try:
+            updates = await self.client(ImportChatInviteRequest(inv_hash))
+            ent = await self._entity_from_updates_with_fallback(updates)
+            if ent is not None:
+                return ent, None
+        except Exception as e:
+            err_low = str(e).lower()
+            if _is_updates_parsing_bug(e):
+                pass
+            elif (
+                "already a participant" in err_low
+                or "already_participant" in err_low
+                or "useralreadyparticipant" in err_low
+            ):
+                pass
+            else:
+                if "timeout" in err_low or "timed out" in err_low:
+                    return None, "Timeout koneksi Telegram saat join undangan (jaringan VPS?)"
+                return None, f"Gagal buka undangan: {str(e)[:120]}"
+
+        if updates is not None:
+            ent = await self._entity_from_updates_with_fallback(updates)
+            if ent is not None:
+                return ent, None
+
+        try:
+            ent, _ = await self._entity_from_invite_hash_check(inv_hash)
+            if ent is not None:
+                return ent, None
+        except Exception:
+            pass
+
+        return None, (
+            "Undangan tidak mengembalikan info grup. "
+            "Link mungkin valid — coba pastikan userbot sudah login dan VPS bisa akses Telegram."
+        )
+
     async def resolve_group_entity_for_invite(self, group_link: str):
         """Resolve grup/supergroup dari link undangan atau username publik."""
         link = (group_link or "").strip()
@@ -884,33 +981,7 @@ class TelethonAuth:
             m = re.search(r'joinchat/([A-Za-z0-9_-]+)', link, re.I)
         if m:
             inv_hash = m.group(1)
-            try:
-                checked = await self.client(CheckChatInviteRequest(inv_hash))
-                if isinstance(checked, ChatInviteAlready):
-                    ch = getattr(checked, "chat", None)
-                    if ch is not None:
-                        return ch, None
-                updates = await self.client(ImportChatInviteRequest(inv_hash))
-                chats = getattr(updates, "chats", None) or []
-                if chats:
-                    return chats[0], None
-                return None, "Undangan tidak mengembalikan info grup (kedaluwarsa atau tidak valid?)."
-            except Exception as e:
-                err_low = str(e).lower()
-                if (
-                    "already a participant" in err_low
-                    or "already_participant" in err_low
-                    or "useralreadyparticipant" in err_low
-                ):
-                    try:
-                        checked = await self.client(CheckChatInviteRequest(inv_hash))
-                        if isinstance(checked, ChatInviteAlready):
-                            ch = getattr(checked, "chat", None)
-                            if ch is not None:
-                                return ch, None
-                    except Exception:
-                        pass
-                return None, f"Gagal buka undangan: {str(e)}"
+            return await self._resolve_invite_hash(inv_hash)
 
         m = re.search(r'(?:telegram\.me|t\.me)/([a-zA-Z_][a-zA-Z0-9_]{3,})', link, re.I)
         uname = m.group(1) if m else None
